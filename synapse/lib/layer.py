@@ -2757,6 +2757,9 @@ class Layer(s_nexus.Pusher):
         if self.growsize is not None:
             slabopts['growsize'] = self.growsize
 
+        if self.core.readonly:
+            slabopts['readonly'] = True
+
         await self._initSlabs(slabopts)
 
         if self.fresh:

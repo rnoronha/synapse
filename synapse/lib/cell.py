@@ -1220,6 +1220,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             'issuewait': 1
         }
 
+        self.readonly = readonly
+
         self.safemode = self.conf.req('safemode')
         if self.safemode:
             mesg = f'Booting {self.getCellType()} in safe-mode. Some functionality may be disabled.'
@@ -1337,7 +1339,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
 
         self.optimizeddb = self.slab.initdb('cell:optimized')  # time -> optimization record
 
-        if self._save_optimized:
+        if self._save_optimized and not self.readonly:
             lkey = s_common.int64en(self._last_optimized['init']['time'])
             self.slab.put(lkey, s_msgpack.en(self._last_optimized), db=self.optimizeddb)
             self._save_optimized = False
@@ -1370,7 +1372,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             logger.error(mesg)
             raise s_exc.BadVersion(mesg=mesg, currver=self.VERSION, lastver=lastver)
 
-        self.cellinfo.set('cell:version', self.VERSION)
+        if not self.readonly:
+            self.cellinfo.set('cell:version', self.VERSION)
 
         # Check the synapse version didn't regress
         if (lastver := self.cellinfo.get('synapse:version')) is not None and s_version.version < lastver:
@@ -1378,7 +1381,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             logger.error(mesg)
             raise s_exc.BadVersion(mesg=mesg, currver=s_version.version, lastver=lastver)
 
-        self.cellinfo.set('synapse:version', s_version.version)
+        if not self.readonly:
+            self.cellinfo.set('synapse:version', s_version.version)
 
         self.nexsvers = self.cellinfo.get('nexus:version', (0, 0))
         self.nexspatches = ()
@@ -1390,7 +1394,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         self.auth = await self._initCellAuth()
 
         auth_passwd = self.conf.get('auth:passwd')
-        if auth_passwd is not None:
+        if auth_passwd is not None and not self.readonly:
             user = await self.auth.getUserByName('root')
 
             if not await user.tryPasswd(auth_passwd, nexs=False, enforce_policy=False):
@@ -1844,6 +1848,14 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         self.cellvers.set(name, vers)
 
     async def _bumpCellVers(self, name, updates, nexs=True):
+
+        if self.readonly:
+            curv = self.cellvers.get(name, 0)
+            reqv = updates[-1][0]
+            if curv < reqv:
+                mesg = f'Storage requires migration ({name} v{curv} -> v{reqv}). Boot in write mode first.'
+                raise s_exc.NeedConfValu(mesg=mesg)
+            return
 
         if self.inaugural:
             await self.setCellVers(name, updates[-1][0], nexs=nexs)
@@ -3726,7 +3738,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             _slab.initdb('hive')
             await _slab.fini()
 
-        self.slab = await self._initSlabFile(path)
+        self.slab = await self._initSlabFile(path, readonly=readonly)
 
     async def _initCellAuth(self):
 
