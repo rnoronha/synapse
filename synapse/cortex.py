@@ -925,9 +925,13 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         if self.inaugural:
             self.cellinfo.set('cortex:version', s_version.version)
 
+        if not self.readonly:
+            self.cellinfo.set('cortex:version', s_version.version)
+
         corevers = self.cellinfo.get('cortex:version')
-        s_version.reqVersion(corevers, reqver, exc=s_exc.BadStorageVersion,
-                             mesg='cortex version in storage is incompatible with running software')
+        if corevers is not None:
+            s_version.reqVersion(corevers, reqver, exc=s_exc.BadStorageVersion,
+                                 mesg='cortex version in storage is incompatible with running software')
 
         self.viewmeta = self.slab.initdb('view:meta')
 
@@ -2386,7 +2390,7 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
     async def _initCoreQueues(self):
         path = os.path.join(self.dirn, 'slabs', 'queues.lmdb')
 
-        slab = await s_lmdbslab.Slab.anit(path)
+        slab = await s_lmdbslab.Slab.anit(path, readonly=self.readonly)
         self.onfini(slab.fini)
 
         self.multiqueue = await slab.getMultiQueue('cortex:queue', nexsroot=self.nexsroot)
@@ -2395,7 +2399,7 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
     async def _initStormGraphs(self):
         path = os.path.join(self.dirn, 'slabs', 'graphs.lmdb')
 
-        slab = await s_lmdbslab.Slab.anit(path)
+        slab = await s_lmdbslab.Slab.anit(path, readonly=self.readonly)
         self.onfini(slab.fini)
 
         self.pkggraphs = {}
@@ -4627,13 +4631,13 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
                 with open(idenpath, 'r') as fd:
                     existiden = fd.read()
 
-                if jsoniden != existiden:
+                if jsoniden != existiden and not self.readonly:
                     with open(idenpath, 'w') as fd:
                         fd.write(jsoniden)
 
             # Disable sysctl checks for embedded jsonstor server
             conf = {'cell:guid': jsoniden, 'health:sysctl:checks': False}
-            self.jsonstor = await s_jsonstor.JsonStorCell.anit(path, conf=conf, parent=self)
+            self.jsonstor = await s_jsonstor.JsonStorCell.anit(path, conf=conf, parent=self, readonly=self.readonly)
 
     async def getJsonObj(self, path):
         if self.jsonurl is not None:
@@ -4718,7 +4722,7 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             if cadir is not None:
                 conf['tls:ca:dir'] = cadir
 
-            self.axon = await s_axon.Axon.anit(path, conf=conf, parent=self)
+            self.axon = await s_axon.Axon.anit(path, conf=conf, parent=self, readonly=self.readonly)
             self.axoninfo = await self.axon.getCellInfo()
             self.axon.onfini(self.axready.clear)
             self.dynitems['axon'] = self.axon

@@ -1669,6 +1669,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         self._cellguidfd.close()
 
     def _getCellLock(self):
+        if self.readonly:
+            return
         cmd = fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
             fcntl.lockf(self._cellguidfd, cmd)
@@ -2005,10 +2007,16 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             (2, self._driveCellMigration),
         ), nexs=False)
 
-        path = s_common.gendir(self.dirn, 'slabs', 'drive.lmdb')
+        if self.readonly:
+            path = s_common.genpath(self.dirn, 'slabs', 'drive.lmdb')
+        else:
+            path = s_common.gendir(self.dirn, 'slabs', 'drive.lmdb')
         sockpath = s_common.genpath(self.sockdirn, 'drive')
 
-        if s_common.envbool('SYNDEV_CELL_DRIVE_NOSPAWN'):
+        if self.readonly:
+            self.drive_slab = await self._initSlabFile(path, readonly=True)
+            self.drive = await s_drive.Drive.anit(self.drive_slab, s_drive.CELLDRIVE)
+        elif s_common.envbool('SYNDEV_CELL_DRIVE_NOSPAWN'):
             self.drive_slab = await self._initSlabFile(path)
             self.drive = await s_drive.Drive.anit(self.drive_slab, s_drive.CELLDRIVE)
         else:

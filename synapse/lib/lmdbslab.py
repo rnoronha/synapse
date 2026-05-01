@@ -1265,6 +1265,10 @@ class Slab(s_base.Base):
                 # This can only happen if readonly and another process added data (e.g. cortex spawn)
                 # _initCoXact knows the magic to resolve this
                 self._initCoXact()
+            except lmdb.NotFoundError:
+                if self.readonly:
+                    return None
+                raise
 
     def dropdb(self, name):
         '''
