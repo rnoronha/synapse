@@ -1731,6 +1731,22 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         role = await self.auth.getRoleByName('all')
         await role.addRule((True, ('layer', 'read')), gateiden=layriden)
 
+    def _lmdbReaderCheck(self):
+        '''Clear stale LMDB reader slots from crashed reader processes.'''
+        stale = 0
+        stale += self.slab.lenv.reader_check()
+        for layr in self.layers.values():
+            stale += layr.layrslab.lenv.reader_check()
+        if stale:
+            logger.info('Cleared %d stale LMDB reader slot(s)', stale)
+        return stale
+
+    async def _lmdbReaderCheckLoop(self):
+        while not self.isfini:
+            await self.waitfini(timeout=60)
+            if not self.isfini:
+                await s_coro.executor(self._lmdbReaderCheck)
+
     async def initServiceRuntime(self):
 
         # do any post-nexus initialization here...
@@ -1741,6 +1757,8 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
 
         if not self.safemode:
             self.addActiveCoro(self.agenda.runloop)
+
+        self.addActiveCoro(self._lmdbReaderCheckLoop)
 
         await self._initStormSvcs()
 

@@ -780,6 +780,9 @@ class Slab(s_base.Base):
     # warn if commit takes too long
     WARN_COMMIT_TIME_MS = int(float(os.environ.get('SYN_SLAB_COMMIT_WARN', '1.0')) * 1000)
 
+    # how often to refresh the read-only transaction to release the MVCC snapshot
+    READONLY_REFRESH_PERIOD = float(os.environ.get('SYN_SLAB_READONLY_REFRESH', '5.0'))
+
     DEFAULT_MAPSIZE = s_const.gibibyte
     DEFAULT_GROWSIZE = None
 
@@ -960,6 +963,8 @@ class Slab(s_base.Base):
 
         if not self.readonly:
             await Slab.initSyncLoop(self)
+        else:
+            self.schedCoro(self._ro_refresh_loop())
 
     def __repr__(self):
         return 'Slab: %r' % (self.path,)
@@ -1027,6 +1032,26 @@ class Slab(s_base.Base):
         self.txnrefcount -= 1
         if not self.txnrefcount:
             self._finiCoXact()
+
+    def _refresh_ro_xact(self):
+        '''Cycle the read-only transaction to release the MVCC snapshot.'''
+        if self.xact is None:
+            return
+
+        [scan.bump() for scan in self.scans]
+
+        self.xact.abort()
+        del self.xact
+        self.xact = None
+
+        self._initCoXact()
+
+    async def _ro_refresh_loop(self):
+        '''Periodically refresh the read-only transaction.'''
+        while not self.isfini:
+            await self.waitfini(timeout=self.READONLY_REFRESH_PERIOD)
+            if not self.isfini:
+                self._refresh_ro_xact()
 
     def _saveOptsFile(self):
         if self.readonly:
