@@ -908,11 +908,12 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             'description': 'An optional directory of CAs which are added to the TLS CA chain for Storm HTTP API calls.',
             'type': 'string',
         },
-        'multiprocess:readers': {
-            'description': 'Number of read-only Cortex reader subprocesses to spawn.',
+        'multi:process:readers': {
+            'description': 'Percentage of available CPU cores to use as read-only reader subprocesses. 0=disabled (default), 50=half the cores, 99=all but one core. Rounds down.',
             'type': 'integer',
             'default': 0,
             'minimum': 0,
+            'maximum': 100,
         },
     }
 
@@ -1825,9 +1826,12 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         if self.readonly:
             return
 
-        count = self.conf.get('multiprocess:readers', 0)
-        if not count:
+        pct = self.conf.get('multi:process:readers', 0)
+        if not pct:
             return
+
+        cores = os.cpu_count() or 1
+        count = max(1, int(cores * pct / 100))
 
         self.readermgr = await s_readermanager.ReaderManager.anit(self.dirn, count=count)
         await self.readermgr.start()
