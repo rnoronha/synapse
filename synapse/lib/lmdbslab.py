@@ -1044,7 +1044,11 @@ class Slab(s_base.Base):
         del self.xact
         self.xact = None
 
-        self._initCoXact()
+        try:
+            self._initCoXact()
+        except Exception:
+            logger.exception("Failed to refresh readonly transaction, shutting down slab")
+            self.schedCallSafe(self.fini)
 
     async def _ro_refresh_loop(self):
         '''Periodically refresh the read-only transaction.'''
