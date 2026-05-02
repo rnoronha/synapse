@@ -33,21 +33,15 @@ def _pid_from_port(port):
             ['ss', '-tlnp', f'sport = :{port}'],
             text=True, stderr=subprocess.DEVNULL,
         )
-        # Parse pid=NNNN from ss output
-        for token in out.split():
-            if token.startswith('pid='):
-                return int(token.split('=')[1].rstrip(',)'))
+        for line in out.splitlines():
+            if not line.startswith('LISTEN'):
+                continue
+            match = re.search(r'pid=(\d+)', line)
+            if match:
+                return int(match.group(1))
     except (subprocess.CalledProcessError, ValueError):
         pass
-    # Fallback to lsof
-    try:
-        out = subprocess.check_output(
-            ['lsof', '-ti', f':{port}'],
-            text=True, stderr=subprocess.DEVNULL,
-        )
-        return int(out.strip().splitlines()[0])
-    except Exception:
-        return None
+    return None
 
 
 async def _get_cell_info(url, timeout=5):
