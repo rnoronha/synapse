@@ -284,6 +284,9 @@ class NexsRoot(s_base.Base):
         if not self.donexslog:  # pragma: no cover
             return
 
+        if self.cell.readonly:
+            return
+
         indxitem = await self.nexslog.last()
         if indxitem is None:
             # We have a brand new log

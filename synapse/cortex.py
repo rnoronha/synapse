@@ -1822,6 +1822,9 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             logger.exception(f'Error starting stormpool, it will not be available: {e}')
 
     async def _initQueryRouter(self):
+        if self.readonly:
+            return
+
         count = self.conf.get('multiprocess:readers', 0)
         if not count:
             return
