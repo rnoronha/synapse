@@ -9,6 +9,7 @@ import asyncio
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -135,10 +136,9 @@ async def main():
     # --- Step 2: Seed 100 nodes through router ---
     async def seed_nodes():
         async with await s_telepath.openurl(args.url) as prox:
-            await prox.callStorm(
-                '[ inet:fqdn=$vals ]',
-                opts={'vars': {'vals': [f'recovery-{i}.test.com' for i in range(100)]}},
-            )
+            for i in range(100):
+                async for _ in prox.storm(f'[inet:fqdn=recovery-{i}.test.com]'):
+                    pass
         return '100 inet:fqdn nodes seeded'
 
     steps.append(await run_step('2. Seed 100 nodes', seed_nodes))
