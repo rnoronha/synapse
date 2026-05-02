@@ -47,6 +47,8 @@ import synapse.lib.jsonstor as s_jsonstor
 import synapse.lib.modelrev as s_modelrev
 import synapse.lib.stormsvc as s_stormsvc
 import synapse.lib.lmdbslab as s_lmdbslab
+import synapse.lib.queryrouter as s_queryrouter
+import synapse.lib.readermanager as s_readermanager
 
 import synapse.lib.crypto.rsa as s_rsa
 
@@ -906,6 +908,12 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             'description': 'An optional directory of CAs which are added to the TLS CA chain for Storm HTTP API calls.',
             'type': 'string',
         },
+        'multiprocess:readers': {
+            'description': 'Number of read-only Cortex reader subprocesses to spawn.',
+            'type': 'integer',
+            'default': 0,
+            'minimum': 0,
+        },
     }
 
     cellapi = CoreApi
@@ -972,6 +980,9 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         self.stormpool = None
         self.stormpoolurl = None
         self.stormpoolopts = None
+
+        self.queryrouter = None
+        self.readermgr = None
 
         self.libroot = (None, {}, {})
         self.stormlibs = []
@@ -1732,6 +1743,8 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
 
         await self._initStormSvcs()
 
+        await self._initQueryRouter()
+
         # share ourself via the cell dmon as "cortex"
         # for potential default remote use
         self.dmon.share('cortex', self)
@@ -1807,6 +1820,26 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
 
         except Exception as e:  # pragma: no cover
             logger.exception(f'Error starting stormpool, it will not be available: {e}')
+
+    async def _initQueryRouter(self):
+        count = self.conf.get('multiprocess:readers', 0)
+        if not count:
+            return
+
+        self.readermgr = await s_readermanager.ReaderManager.anit(self.dirn, count=count)
+        await self.readermgr.start()
+        self.onfini(self.readermgr.fini)
+
+        reader_urls = self.readermgr.get_reader_urls()
+        self.queryrouter = s_queryrouter.QueryRouter(reader_urls)
+        logger.info('Query router initialized with %d reader(s).', len(reader_urls))
+
+        async def _finiQueryRouter():
+            if self.queryrouter is not None:
+                await self.queryrouter.fini()
+                self.queryrouter = None
+
+        self.onfini(_finiQueryRouter)
 
     async def finiStormPool(self):
 
@@ -6325,6 +6358,16 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
 
         opts = self._initStormOpts(opts)
 
+        if self.queryrouter is not None:
+            proxy, is_local = await self.queryrouter.route(text, opts)
+            if not is_local:
+                try:
+                    async for mesg in proxy.storm(text, opts=opts):
+                        yield mesg
+                    return
+                except Exception:
+                    logger.warning('Reader proxy failed, falling back to local execution.')
+
         if self.stormpool is not None and opts.get('mirror', True):
             proxy = await self._getMirrorProxy(opts)
 
@@ -6358,6 +6401,14 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
     async def callStorm(self, text, opts=None):
 
         opts = self._initStormOpts(opts)
+
+        if self.queryrouter is not None:
+            proxy, is_local = await self.queryrouter.route(text, opts)
+            if not is_local:
+                try:
+                    return await proxy.callStorm(text, opts=opts)
+                except Exception:
+                    logger.warning('Reader proxy failed, falling back to local execution.')
 
         if self.stormpool is not None and opts.get('mirror', True):
             proxy = await self._getMirrorProxy(opts)

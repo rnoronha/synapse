@@ -4140,6 +4140,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
                           help=f'The (optional) additional name to share the {name} as. This defaults to '
                                f'{telendef}, and may be also be overridden by the {telenvar} environment'
                                f' variable.')
+        pars.add_argument('--readonly', default=False, action='store_true',
+                          help='Start the cell in read-only mode.')
 
         if conf is not None:
             args = conf.getArgParseArgs()
@@ -4584,7 +4586,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         s_processpool._setPoolLogging(logconf)
 
         try:
-            cell = await cls.anit(opts.dirn, conf=conf)
+            cell = await cls.anit(opts.dirn, conf=conf, readonly=opts.readonly)
         except:
             logger.exception(f'Error starting cell at {opts.dirn}')
             raise
