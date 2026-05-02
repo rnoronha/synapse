@@ -887,6 +887,7 @@ class Slab(s_base.Base):
         self.recovering = False
 
         opts.setdefault('max_dbs', 128)
+        opts.setdefault('max_readers', 256)
         opts.setdefault('writemap', True)
 
         self.maxsize = opts.pop('maxsize', None)
