@@ -116,6 +116,8 @@ async def main():
                         help='Number of concurrent queries (default: 20)')
     parser.add_argument('--runs', type=int, default=3,
                         help='Number of benchmark runs (default: 3)')
+    parser.add_argument('--warmup', type=int, default=5,
+                        help='Number of warmup queries before measuring (default: 5)')
     parser.add_argument('--output', type=str, default=None,
                         help='Path to write JSON results')
     args = parser.parse_args()
@@ -134,6 +136,17 @@ async def main():
 
         print('Seeding data (1000 nodes):')
         await _seed_nodes(prox)
+
+        # Warmup: run unmeasured queries to warm the LMDB page cache
+        print(f'\nWarmup: {args.warmup} iterations (not measured)...')
+        warmup_t0 = time.monotonic()
+        for i in range(args.warmup):
+            if _shutdown.is_set():
+                break
+            await _run_sequential(prox, queries)
+            await _run_concurrent(prox, queries)
+        warmup_time = round(time.monotonic() - warmup_t0, 6)
+        print(f'Warmup complete in {warmup_time:.3f}s\n')
 
         for run_num in range(1, args.runs + 1):
             if _shutdown.is_set():
@@ -167,8 +180,10 @@ async def main():
                 'url': args.url,
                 'concurrency': args.concurrency,
                 'runs': args.runs,
+                'warmup': args.warmup,
                 'queries': QUERIES,
             },
+            'warmup_time': warmup_time,
             'results': results,
         }
         with open(args.output, 'w') as f:
