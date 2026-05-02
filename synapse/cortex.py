@@ -6362,7 +6362,7 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         opts = self._initStormOpts(opts)
 
         if self.queryrouter is not None:
-            proxy, is_local = await self.queryrouter.route(text, opts)
+            proxy, is_local, reader_url = await self.queryrouter.route(text, opts)
             if not is_local:
                 try:
                     async for mesg in proxy.storm(text, opts=opts):
@@ -6370,6 +6370,8 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
                     return
                 except Exception:
                     logger.warning('Reader proxy failed, falling back to local execution.')
+                finally:
+                    self.queryrouter.release(reader_url)
 
         if self.stormpool is not None and opts.get('mirror', True):
             proxy = await self._getMirrorProxy(opts)
@@ -6406,12 +6408,14 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         opts = self._initStormOpts(opts)
 
         if self.queryrouter is not None:
-            proxy, is_local = await self.queryrouter.route(text, opts)
+            proxy, is_local, reader_url = await self.queryrouter.route(text, opts)
             if not is_local:
                 try:
                     return await proxy.callStorm(text, opts=opts)
                 except Exception:
                     logger.warning('Reader proxy failed, falling back to local execution.')
+                finally:
+                    self.queryrouter.release(reader_url)
 
         if self.stormpool is not None and opts.get('mirror', True):
             proxy = await self._getMirrorProxy(opts)

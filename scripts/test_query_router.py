@@ -75,14 +75,14 @@ class TestQueryRouter(unittest.TestCase):
 
     def test_route_write_is_local(self):
         router = s_queryrouter.QueryRouter(['tcp://reader1:1234/cortex'])
-        proxy, is_local = self._run(router.route('[inet:ipv4=1.2.3.4]'))
+        proxy, is_local, reader_url = self._run(router.route('[inet:ipv4=1.2.3.4]'))
         self.assertIsNone(proxy)
         self.assertTrue(is_local)
         self._run(router.fini())
 
     def test_route_read_with_no_readers(self):
         router = s_queryrouter.QueryRouter([])
-        proxy, is_local = self._run(router.route('inet:ipv4'))
+        proxy, is_local, reader_url = self._run(router.route('inet:ipv4'))
         self.assertIsNone(proxy)
         self.assertTrue(is_local)
         self._run(router.fini())
@@ -94,9 +94,10 @@ class TestQueryRouter(unittest.TestCase):
         mock_openurl.return_value = mock_proxy
 
         router = s_queryrouter.QueryRouter(['tcp://reader1:1234/cortex'])
-        proxy, is_local = self._run(router.route('inet:ipv4'))
+        proxy, is_local, reader_url = self._run(router.route('inet:ipv4'))
         self.assertIs(proxy, mock_proxy)
         self.assertFalse(is_local)
+        router.release(reader_url)
         self._run(router.fini())
 
     @patch('synapse.lib.queryrouter.s_telepath.openurl', new_callable=AsyncMock)
@@ -115,11 +116,13 @@ class TestQueryRouter(unittest.TestCase):
             'tcp://reader2:1234/cortex',
         ])
 
-        proxy1, _ = self._run(router.route('inet:ipv4'))
-        proxy2, _ = self._run(router.route('inet:fqdn'))
+        proxy1, _, url1 = self._run(router.route('inet:ipv4'))
+        proxy2, _, url2 = self._run(router.route('inet:fqdn'))
 
         self.assertIs(proxy1, proxies[0])
         self.assertIs(proxy2, proxies[1])
+        router.release(url1)
+        router.release(url2)
         self._run(router.fini())
 
     @patch('synapse.lib.queryrouter.s_telepath.openurl', new_callable=AsyncMock)
@@ -127,7 +130,7 @@ class TestQueryRouter(unittest.TestCase):
         mock_openurl.side_effect = ConnectionRefusedError('dead')
 
         router = s_queryrouter.QueryRouter(['tcp://reader1:1234/cortex'])
-        proxy, is_local = self._run(router.route('inet:ipv4'))
+        proxy, is_local, reader_url = self._run(router.route('inet:ipv4'))
         self.assertIsNone(proxy)
         self.assertTrue(is_local)
         self._run(router.fini())
@@ -145,14 +148,15 @@ class TestQueryRouter(unittest.TestCase):
         router = s_queryrouter.QueryRouter(['tcp://reader1:1234/cortex'])
 
         # First call gets dead proxy, falls back to local
-        proxy, is_local = self._run(router.route('inet:ipv4'))
+        proxy, is_local, reader_url = self._run(router.route('inet:ipv4'))
         self.assertIsNone(proxy)
         self.assertTrue(is_local)
 
         # Second call reconnects and gets fresh proxy
-        proxy, is_local = self._run(router.route('inet:ipv4'))
+        proxy, is_local, reader_url = self._run(router.route('inet:ipv4'))
         self.assertIs(proxy, fresh_proxy)
         self.assertFalse(is_local)
+        router.release(reader_url)
         self._run(router.fini())
 
 

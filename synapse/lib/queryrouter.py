@@ -1,4 +1,5 @@
 import re
+import asyncio
 import logging
 
 import synapse.exc as s_exc
@@ -85,6 +86,14 @@ class QueryRouter:
         self._healthy = list(reader_urls)
         self._rr_index = 0
 
+        # Admission control
+        self._max_concurrent = 10
+        self._queue_timeout = 30.0
+        self._queue_depth = 100
+        self._pending = 0
+        self._rejected = 0
+        self._reader_semaphores = {url: asyncio.Semaphore(self._max_concurrent) for url in reader_urls}
+
     async def fini(self):
         for proxy in self._proxies.values():
             await proxy.fini()
@@ -137,13 +146,58 @@ class QueryRouter:
         Route a query to the appropriate target.
 
         Returns:
-            (proxy_or_none, is_local): proxy is None when query should run locally.
+            (proxy_or_none, is_local, reader_url_or_none)
         '''
         if classify(text) == 'write':
-            return (None, True)
+            return (None, True, None)
+
+        if self._pending >= self._queue_depth:
+            self._rejected += 1
+            raise s_exc.SynErr(mesg='Query queue full, server busy')
 
         proxy = await self.getReaderProxy()
         if proxy is None:
-            return (None, True)
+            return (None, True, None)
 
-        return (proxy, False)
+        # Determine which URL this proxy belongs to
+        reader_url = None
+        for url, p in self._proxies.items():
+            if p is proxy:
+                reader_url = url
+                break
+
+        self._pending += 1
+
+        # Ensure semaphore exists for this reader
+        if reader_url not in self._reader_semaphores:
+            self._reader_semaphores[reader_url] = asyncio.Semaphore(self._max_concurrent)
+
+        sem = self._reader_semaphores[reader_url]
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=self._queue_timeout)
+        except asyncio.TimeoutError:
+            self._pending -= 1
+            self._rejected += 1
+            raise s_exc.SynErr(mesg='Query queue timeout waiting for reader capacity')
+
+        return (proxy, False, reader_url)
+
+    def release(self, reader_url):
+        '''Release admission control resources after a routed query completes.'''
+        self._pending = max(0, self._pending - 1)
+        sem = self._reader_semaphores.get(reader_url)
+        if sem is not None:
+            sem.release()
+
+    def get_stats(self):
+        '''Return admission control statistics.'''
+        per_reader = {}
+        for url, sem in self._reader_semaphores.items():
+            per_reader[url] = self._max_concurrent - sem._value
+        return {
+            'pending': self._pending,
+            'rejected': self._rejected,
+            'max_concurrent': self._max_concurrent,
+            'queue_depth': self._queue_depth,
+            'per_reader_pending': per_reader,
+        }
