@@ -1,0 +1,13 @@
+{
+  "snapshots": {
+    "v1": {
+      "snapshot_id": "snap-0572436bb7e5d6d78",
+      "volume_size_gib": 2,
+      "node_count": 311685,
+      "branch": "phase2-multi-process",
+      "created": "2026-05-03T12:43:11Z",
+      "region": "us-east-1"
+    }
+  },
+  "current": "v1"
+}

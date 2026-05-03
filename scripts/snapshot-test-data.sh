@@ -90,7 +90,7 @@ run_ssm "sudo umount $MOUNT_POINT 2>/dev/null || true"
 aws ec2 detach-volume \
     --region "$REGION" \
     --volume-id "$VOLUME_ID" \
-    --force --output text >/dev/null
+    --force --output text >/dev/null 2>&1 || true
 
 echo "Waiting for volume to detach..."
 aws ec2 wait volume-available --region "$REGION" --volume-ids "$VOLUME_ID"
@@ -103,7 +103,7 @@ echo "── STEP 3: CREATE SNAPSHOT ──────────────�
 SNAPSHOT_ID=$(aws ec2 create-snapshot \
     --region "$REGION" \
     --volume-id "$VOLUME_ID" \
-    --description "Synapse test data $DATASET_VERSION — 310K+ nodes" \
+    --description "Synapse test data $DATASET_VERSION - 310K+ nodes" \
     --tag-specifications "ResourceType=snapshot,Tags=[
         {Key=Name,Value=synapse-test-data-$DATASET_VERSION},
         {Key=dataset-version,Value=$DATASET_VERSION},
