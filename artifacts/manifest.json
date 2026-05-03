@@ -1,0 +1,29 @@
+{
+  "created": "2026-05-03T02:31:45Z",
+  "branches": {
+    "master": {
+      "commit": "37cb55c2f48109903ee840a687eee9cc2c36b88f",
+      "commit_short": "37cb55c2f",
+      "artifact": "synapse-master-37cb55c2f.tar.gz",
+      "s3": "s3://rodrigon-testing-artifacts/synapse-master-37cb55c2f.tar.gz"
+    },
+    "g3": {
+      "commit": "0224ac41e0db67ba1961ee48a4adad2ff64e9f96",
+      "commit_short": "0224ac41e",
+      "artifact": "synapse-g3-0224ac41e.tar.gz",
+      "s3": "s3://rodrigon-testing-artifacts/synapse-g3-0224ac41e.tar.gz"
+    },
+    "phase2": {
+      "commit": "87ea410e36dfff3e3dddc10c6676bce09da283ce",
+      "commit_short": "87ea410e3",
+      "artifact": "synapse-phase2-87ea410e3.tar.gz",
+      "s3": "s3://rodrigon-testing-artifacts/synapse-phase2-87ea410e3.tar.gz"
+    }
+  },
+  "tests": ["pathological", "soak", "throughput", "correctness", "recovery", "read-after-write"],
+  "matrix": {
+    "master": ["pathological", "soak", "throughput", "read-after-write"],
+    "g3": ["pathological", "soak", "throughput", "read-after-write"],
+    "phase2": ["pathological", "soak", "throughput", "correctness", "recovery", "read-after-write"]
+  }
+}

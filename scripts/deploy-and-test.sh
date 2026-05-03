@@ -13,6 +13,7 @@ set -euo pipefail
 BRANCH=""
 TEST=""
 READERS=""
+ARTIFACT=""
 INSTANCE_TYPE="c5.4xlarge"
 DURATION=600
 REGION="us-east-1"
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
         --branch)        BRANCH="$2";        shift 2;;
         --test)          TEST="$2";          shift 2;;
         --readers)       READERS="$2";       shift 2;;
+        --artifact)      ARTIFACT="$2";      shift 2;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2;;
         --duration)      DURATION="$2";      shift 2;;
         --region)        REGION="$2";        shift 2;;
@@ -48,6 +50,7 @@ if [[ -z "$TEST" ]]; then
     echo "Options:"
     echo "  --branch <name>         Branch to test (default: current branch)"
     echo "  --readers <0|25|50>     Reader percentage (default: 0 for master/g3, 50 for phase2)"
+    echo "  --artifact <s3-url>      Use pre-built S3 artifact instead of building from git"
     echo "  --instance-type <type>  EC2 instance type (default: c5.4xlarge)"
     echo "  --duration <secs>       Soak test duration (default: 600)"
     echo "  --region <region>       AWS region (default: us-east-1)"
@@ -183,6 +186,13 @@ run_ssm "sudo dnf install -y python3.11 python3.11-pip python3.11-devel gcc && p
 echo ""
 echo "── PHASE 3: TRANSFER CODE ─────────────────────────────────"
 
+if [[ -n "$ARTIFACT" ]]; then
+    echo "Using pinned artifact: $ARTIFACT"
+    run_ssm "mkdir -p /home/ec2-user/synapse && aws s3 cp $ARTIFACT /tmp/synapse-deploy.tar.gz --region $REGION && tar xzf /tmp/synapse-deploy.tar.gz -C /home/ec2-user/synapse"
+    run_ssm "cd /home/ec2-user/synapse && pip3.11 install --user -e . 2>\&1 | tail -3"
+    run_ssm "python3.11 -c 'import synapse; print(synapse.__file__)'"
+else
+
 ORIG_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 NEED_CHECKOUT=false
 
@@ -232,6 +242,7 @@ if ! echo "$IMPORT_PATH" | grep -q "/home/ec2-user/synapse/"; then
     exit 1
 fi
 
+fi
 # ── PHASE 4: START CORTEX ─────────────────────────────────────────────
 echo ""
 echo "── PHASE 4: START CORTEX ──────────────────────────────────"
