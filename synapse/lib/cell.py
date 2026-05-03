@@ -4643,6 +4643,199 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
 
         await cell.main()
 
+    @classmethod
+    def startmain(cls, argv, outp=None):
+        '''Sync entry point that supports the init → fork → serve lifecycle.
+
+        If the cell has fork mode enabled (getForkInfo() returns non-None),
+        the lifecycle is:
+
+        1. asyncio.run(init) — initialize the cell, event loop closes on return
+        2. os.fork() × N — fork read workers (no event loop running, safe to fork)
+        3. Writer: asyncio.run(serve) — new event loop for the writer process
+        4. Workers: each creates its own event loop via worker_main()
+
+        If fork mode is not enabled, falls back to the normal asyncio.run(execmain) path.
+        '''
+        # Fast path: check if fork mode could be active before doing the
+        # two-phase init.  Only Cortex with multi:process:readers > 0 uses it.
+        # For all other cells, use the original single-phase path.
+        #
+        # We probe the config to decide without initializing the cell twice.
+        # If the probe is inconclusive, we use the two-phase path and fall
+        # back to normal mode if prepareFork() returns None.
+        if not cls._mayFork(argv):
+            asyncio.run(cls.execmain(argv, outp=outp))
+            return
+
+        import synapse.lib.arbiter as s_arbiter
+        import synapse.lib.worker as s_worker
+
+        if outp is None:
+            outp = s_output.stdout
+
+        # Phase 1: Initialize the cell (event loop created and destroyed by asyncio.run)
+        cell_info = asyncio.run(cls._initForFork(argv, outp=outp))
+
+        cell = cell_info['cell']
+        fork_info = cell_info.get('fork_info')
+
+        if fork_info is None:
+            # prepareFork() returned None — fall back to normal serve.
+            # The cell is already initialized; just need to serve.
+            # Re-create listeners and active coros in a new event loop.
+            async def _fallback_serve():
+                await cell._restoreAfterInitLoop()
+                await cell.main()
+            asyncio.run(_fallback_serve())
+            return
+
+        # Phase 2: Fork workers (no event loop running — safe to fork)
+        listen_fd = fork_info['listen_fd']
+        uds_path = fork_info['uds_path']
+        datadir = fork_info['datadir']
+        count = fork_info['count']
+
+        def _worker_entry(listen_sock, uds_path_arg, worker_id):
+            s_worker.worker_main(listen_sock, uds_path_arg, datadir)
+
+        arbiter = s_arbiter.Arbiter()
+        arbiter.fork_workers(count, listen_fd, uds_path, _worker_entry)
+
+        # Phase 3: Writer process creates a new event loop and serves
+        async def _writer_serve():
+            # Clear stale server refs and UDS files from the init loop
+            cell.dmon.listenservers.clear()
+            for spath in (os.path.join(cell.dirn, 'sock'), uds_path):
+                try:
+                    os.unlink(spath)
+                except FileNotFoundError:
+                    pass
+
+            # Re-create the local unix socket
+            try:
+                await cell.dmon.listen(f'unix://{os.path.join(cell.dirn, "sock")}')
+            except OSError:
+                logger.warning('Failed to re-create local unix socket')
+
+            # Re-create the TCP listener on the inherited (shared) socket fd
+            await cell._restoreDmonListener(listen_fd)
+            # Re-create the UDS listener for write forwarding
+            await cell.dmon.listen(f'unix://{uds_path}')
+
+            # Re-fire active coros that were cancelled when the init loop closed
+            cell._fireActiveCoros()
+            await cell.main()
+
+        try:
+            asyncio.run(_writer_serve())
+        finally:
+            arbiter.shutdown()
+
+    @classmethod
+    def _mayFork(cls, argv):
+        '''Quick check whether this cell class might use fork mode.
+
+        Returns True if the subclass overrides prepareFork (e.g. Cortex).
+        The actual decision happens in prepareFork() at runtime.
+        '''
+        # Cell.prepareFork doesn't exist — only subclasses that support
+        # fork mode define it.
+        return hasattr(cls, 'prepareFork')
+
+    @classmethod
+    async def _initForFork(cls, argv, outp=None):
+        '''Initialize the cell and return it with fork info.
+
+        The cell is fully initialized (storage, runtime, network) but
+        main() has not been called — no signal handlers, no waitfini.
+        '''
+        if outp is None:
+            outp = s_output.stdout
+
+        cell = await cls.initFromArgv(argv, outp=outp)
+
+        # prepareFork() finalizes fork setup (UDS listener, socket fd lookup)
+        # after all init phases (including network) have completed.
+        fork_info = None
+        if hasattr(cell, 'prepareFork'):
+            fork_info = await cell.prepareFork()
+
+        if fork_info is not None:
+            # Dup the listen fd so it survives event loop teardown.
+            # When asyncio.run() returns, the loop closes and asyncio servers
+            # are cleaned up, but the dup'd fd keeps the OS socket alive.
+            fork_info['listen_fd'] = os.dup(fork_info['listen_fd'])
+
+        return {'cell': cell, 'fork_info': fork_info}
+
+    async def _restoreDmonListener(self, listen_fd):
+        '''Re-create the dmon TCP listener using an inherited socket fd.
+
+        Used after fork to re-attach the shared listening socket to the
+        writer's new event loop.
+        '''
+        sock = socket.socket(fileno=listen_fd)
+        sock.setblocking(False)
+
+        # Determine if SSL is needed from the dmon:listen config
+        turl = self._getDmonListen()
+        sslctx = None
+        if turl is not None:
+            info = s_telepath.chopurl(turl)
+            if info.get('scheme') == 'ssl':
+                caname = info.get('ca')
+                hostname = info.get('hostname', info.get('host'))
+                sslctx = self.dmon.certdir.getServerSSLContext(hostname=hostname, caname=caname)
+
+        is_tls = sslctx is not None
+
+        async def onconn(reader, writer):
+            info = {'tls': is_tls}
+            link = await s_link.Link.anit(reader, writer, info=info)
+            link.schedCoro(self.dmon._onLinkInit(link))
+
+        server = await asyncio.start_server(onconn, sock=sock, ssl=sslctx)
+        self.dmon.listenservers.append(server)
+
+    async def _restoreAfterInitLoop(self):
+        '''Restore cell state after the init event loop has been closed.
+
+        Re-creates dmon listeners and re-fires active coros in the new
+        event loop.  Called by startmain() when the two-phase lifecycle
+        is used (init loop → fork → serve loop).
+        '''
+        # Clear stale asyncio server refs from the init loop
+        self.dmon.listenservers.clear()
+
+        # Remove stale UDS files before re-binding
+        sockpath = os.path.join(self.dirn, 'sock')
+        try:
+            os.unlink(sockpath)
+        except FileNotFoundError:
+            pass
+
+        # Re-create the local unix socket listener
+        try:
+            await self.dmon.listen(f'unix://{sockpath}')
+        except OSError:
+            logger.warning('Failed to re-create local unix socket at %s', sockpath)
+
+        # Re-create the TCP/SSL listener from config
+        turl = self._getDmonListen()
+        if turl is not None:
+            self.sockaddr = await self.dmon.listen(turl)
+
+        # Re-fire active coros that were cancelled when the init loop closed
+        self._fireActiveCoros()
+
+    def getForkInfo(self):
+        '''Return fork config if fork mode is active, else None.
+
+        Subclasses (e.g. Cortex) override this to return fork configuration.
+        '''
+        return None
+
     async def _getCellUser(self, link, mesg):
 
         # check for a TLS client cert
