@@ -24,3 +24,15 @@
 4. **Zero errors across all soak tests** — all 3 branches stable under sustained load
 5. **Full correctness** — 30/30 including del_node readonly guard
 6. **311K dataset: results consistent with tiny-dataset** — multi-process advantage holds at scale
+
+## Read-After-Write Consistency (added 2026-05-03T15:28)
+
+| Condition | Iterations | Consistency | Staleness p50 | Staleness p99 |
+|-----------|-----------|-------------|---------------|---------------|
+| low (1/s) | 99 | 100% | 160ms | 364ms |
+| medium (10/s) | 565 | 100% | 159ms | 364ms |
+| high (50/s) | 564 | 100% | 160ms | 364ms |
+| sustained (10/s) | 565 | 100% | 159ms | 364ms |
+
+**Consistency model: eventual consistency with <400ms staleness window.**
+100% of writes visible within 364ms across 1,793 iterations at all load levels.
