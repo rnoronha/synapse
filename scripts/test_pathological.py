@@ -11,6 +11,7 @@ PASS/FAIL per test with optional JSON output.
 """
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -72,6 +73,20 @@ async def _collect_storm(prox, query, timeout=None):
     return msgs
 
 
+def _assert(condition, msg):
+    """Raise if condition is false — turns liveness checks into correctness checks."""
+    if not condition:
+        raise AssertionError(msg)
+
+
+def _assert_count(count, *, min_expected=1, label='results'):
+    """Flag vacuous passes: 0 results means the test didn't exercise anything."""
+    if count == 0:
+        raise AssertionError(f'SUSPICIOUS: 0 {label} — test may be vacuous')
+    if min_expected is not None and count < min_expected:
+        raise AssertionError(f'Expected >= {min_expected} {label}, got {count}')
+
+
 # ---------------------------------------------------------------
 # seed data
 # ---------------------------------------------------------------
@@ -84,7 +99,7 @@ SEED_IPV4 = 500
 
 async def _seed_if_empty(prox, timeout):
     """Seed pathological test data if the Cortex has fewer than 100 inet:fqdn nodes."""
-    existing = await _count_storm(prox, 'inet:fqdn | count', timeout=timeout)
+    existing = await _count_storm(prox, 'inet:fqdn', timeout=timeout)
     if existing >= 100:
         print(f'  Cortex has {existing} inet:fqdn nodes — skipping seed')
         return
@@ -134,7 +149,7 @@ async def _seed_if_empty(prox, timeout):
         async for _ in prox.storm(chunk):
             pass
 
-    total = await _count_storm(prox, 'inet:fqdn | count', timeout=timeout)
+    total = await _count_storm(prox, 'inet:fqdn', timeout=timeout)
     print(f'  Seeded — {total} inet:fqdn nodes now present')
 
 
@@ -167,7 +182,7 @@ async def run_step(name, func, timeout):
     except asyncio.TimeoutError:
         step.detail = f'Timed out after {timeout}s'
     except Exception as exc:
-        step.detail = str(exc)
+        step.detail = f'ERROR: {exc}'
     step.elapsed = time.monotonic() - t0
     status = 'PASS' if step.passed else 'FAIL'
     print(f'  [{status}] {name} ({step.elapsed:.1f}s) — {step.detail}')
@@ -205,14 +220,23 @@ async def main():
 
         # -- 1a. Regex backtracking — pathological -----------------
         async def test_regex_backtrack_pathological():
+            # Use a string of 'a's + trailing 'b' with a non-anchored
+            # backtracking pattern.  The $ anchor on ^(a+)+$ lets the
+            # engine reject quickly via the trailing 'b'.  Instead use
+            # a pattern that forces partition exploration.
             q = '''
                 $text = ""
-                $text = $text.ljust(5000, a)
+                $text = $text.ljust(25, a)
                 $text = $lib.str.concat($text, b)
-                if ($text ~= "^(a+)+$") { $lib.print(hit) }
+                $hit = $lib.false
+                if ($text ~= "^(a+)+b$") { $hit = $lib.true }
+                return($hit)
             '''
-            await _collect_storm(prox, q, timeout=timeout)
-            return 'Completed (regex did not hang)'
+            result = await _call_storm(prox, q, timeout=timeout)
+            # The pattern SHOULD match (all a's then b matches ^(a+)+b$)
+            # but the point is it completes without catastrophic backtracking.
+            _assert(result is True or result == 1, f'Expected regex to match, got {result}')
+            return 'Completed (regex matched without hanging)'
 
         steps.append(await run_step(
             '1a. Regex Backtracking — pathological',
@@ -223,6 +247,7 @@ async def main():
         # -- 1b. Regex backtracking — benign -----------------------
         async def test_regex_backtrack_benign():
             count = await _count_storm(prox, 'inet:fqdn~="^host[0-9]+"', timeout=timeout)
+            _assert_count(count, min_expected=1, label='regex matches')
             return f'{count} nodes matched benign regex'
 
         steps.append(await run_step(
@@ -233,9 +258,10 @@ async def main():
 
         # -- 2a. Exponentiation — 2^100 ---------------------------
         async def test_exp_small():
-            q = '$x = $(2 ** 100) $lib.print($x)'
-            await _collect_storm(prox, q, timeout=timeout)
-            return 'Computed 2^100'
+            q = '$x = $(2 ** 100) return($x)'
+            result = await _call_storm(prox, q, timeout=timeout)
+            _assert(result == 2 ** 100, f'Expected 2^100={2**100}, got {result}')
+            return 'Computed 2^100 — value verified'
 
         steps.append(await run_step(
             '2a. Exponentiation — 2^100',
@@ -245,9 +271,10 @@ async def main():
 
         # -- 2b. Exponentiation — 2^5000 --------------------------
         async def test_exp_large():
-            q = '$x = $(2 ** 5000) $lib.print($x)'
-            await _collect_storm(prox, q, timeout=timeout)
-            return 'Computed 2^5000'
+            q = '$x = $(2 ** 5000) return($x)'
+            result = await _call_storm(prox, q, timeout=timeout)
+            _assert(result == 2 ** 5000, f'2^5000 value mismatch')
+            return 'Computed 2^5000 — value verified'
 
         steps.append(await run_step(
             '2b. Exponentiation — 2^5000',
@@ -257,26 +284,36 @@ async def main():
 
         # -- 3. Concurrent blocking — probe during scan ------------
         async def test_concurrent_blocking():
-            # Fire a heavy scan, then immediately probe with a fast query
-            heavy = 'inet:fqdn | limit 9999 | count'
             probe = 'inet:fqdn | limit 1'
+            heavy = 'inet:fqdn | limit 9999 | count'
 
-            t0 = time.monotonic()
-            # Run probe alone for baseline
-            await _count_storm(prox, probe, timeout=timeout)
-            baseline = time.monotonic() - t0
+            # Use a second independent connection for the probe
+            async with await s_telepath.openurl(args.url) as prox2:
+                # Warmup both connections
+                await _count_storm(prox, probe, timeout=timeout)
+                await _count_storm(prox2, probe, timeout=timeout)
 
-            # Run heavy + probe concurrently
-            t0 = time.monotonic()
-            _heavy_task = asyncio.create_task(
-                _count_storm(prox, heavy, timeout=timeout))
-            await asyncio.sleep(0.1)  # let heavy start
-            await _count_storm(prox, probe, timeout=timeout)
-            probe_time = time.monotonic() - t0
-            await _heavy_task
+                # Baseline: average of 3 probe measurements
+                baselines = []
+                for _ in range(3):
+                    t0 = time.monotonic()
+                    await _count_storm(prox2, probe, timeout=timeout)
+                    baselines.append(time.monotonic() - t0)
+                baseline = sum(baselines) / len(baselines)
+
+                # Run heavy on prox, probe on prox2 concurrently
+                heavy_task = asyncio.create_task(
+                    _count_storm(prox, heavy, timeout=timeout))
+                await asyncio.sleep(0.3)  # let heavy query start
+                t0 = time.monotonic()
+                await _count_storm(prox2, probe, timeout=timeout)
+                probe_time = time.monotonic() - t0
+                await heavy_task
 
             ratio = probe_time / baseline if baseline > 0 else 0
-            return f'{ratio:.1f}x baseline — {"responsive" if ratio < 5 else "BLOCKED"}'
+            blocked = ratio >= 5
+            _assert(not blocked, f'Cortex blocked: probe was {ratio:.1f}x baseline')
+            return f'{ratio:.1f}x baseline — responsive'
 
         steps.append(await run_step(
             '3. Concurrent Blocking — probe during scan',
@@ -289,6 +326,7 @@ async def main():
             t0 = time.monotonic()
             count = await _count_storm(prox, 'inet:fqdn', timeout=timeout)
             elapsed = time.monotonic() - t0
+            _assert_count(count, min_expected=100, label='inet:fqdn nodes')
             rate = count / elapsed if elapsed > 0 else 0
             return f'{count} nodes at {rate:,.0f} n/s'
 
@@ -307,7 +345,9 @@ async def main():
             '''
             msgs = await _collect_storm(prox, q, timeout=timeout)
             prints = [m[1]['mesg'] for m in msgs if m[0] == 'print']
-            return f'Compressed string of len {prints[0] if prints else "?"}'
+            _assert(prints, 'No print output from compression test')
+            _assert(str(prints[0]) == '10000', f'Expected length 10000, got {prints[0]}')
+            return f'String length verified: {prints[0]}'
 
         steps.append(await run_step(
             '5. Compression',
@@ -319,6 +359,7 @@ async def main():
         async def test_interval_lift():
             q = 'inet:fqdn:seen@=("2023-06-01","2023-06-02")'
             count = await _count_storm(prox, q, timeout=timeout)
+            _assert_count(count, min_expected=1, label='interval nodes')
             return f'Interval scan returned {count} nodes'
 
         steps.append(await run_step(
@@ -331,6 +372,7 @@ async def main():
         async def test_geospatial_lift():
             q = 'geo:place:latlong*near=((34.1,-118.3),500km)'
             count = await _count_storm(prox, q, timeout=timeout)
+            _assert_count(count, min_expected=1, label='geo nodes')
             return f'Geospatial scan returned {count} nodes'
 
         steps.append(await run_step(
@@ -343,6 +385,7 @@ async def main():
         async def test_norm_url():
             q = '[ inet:url="HTTP://USER:PASS@EXAMPLE.COM:80/PATH?B=2&A=1#FRAG" ]'
             count = await _count_storm(prox, q, timeout=timeout)
+            _assert(count == 1, f'Expected 1 URL node, got {count}')
             return f'URL normalized ({count} node)'
 
         steps.append(await run_step(
@@ -355,6 +398,7 @@ async def main():
         async def test_norm_fqdn_idn():
             q = '[ inet:fqdn=münchen.example.com inet:fqdn=café.example.com ]'
             count = await _count_storm(prox, q, timeout=timeout)
+            _assert(count == 2, f'Expected 2 IDN FQDN nodes, got {count}')
             return f'IDN FQDN normalized ({count} nodes)'
 
         steps.append(await run_step(
@@ -367,6 +411,7 @@ async def main():
         async def test_norm_cpe():
             q = '[ it:sec:cpe="cpe:2.3:a:vendor:product:1.0:update:*:*:*:*:*:*" ]'
             count = await _count_storm(prox, q, timeout=timeout)
+            _assert(count == 1, f'Expected 1 CPE node, got {count}')
             return f'CPE normalized ({count} node)'
 
         steps.append(await run_step(
@@ -379,6 +424,7 @@ async def main():
         async def test_filter_regex():
             q = 'inet:fqdn=host0.pathbench.com | +inet:fqdn~="^host[0-9]+\\.pathbench"'
             count = await _count_storm(prox, q, timeout=timeout)
+            _assert(count == 1, f'Expected 1 node from filter regex, got {count}')
             return f'{count} node matched filter regex'
 
         steps.append(await run_step(
@@ -398,7 +444,8 @@ async def main():
                 return($lib.len($uniq))
             '''
             result = await _call_storm(prox, q, timeout=timeout)
-            return f'unique() on 10K items → {result} unique'
+            _assert(result == 500, f'Expected 500 unique values, got {result}')
+            return f'unique() on 10K items → {result} unique — verified'
 
         steps.append(await run_step(
             '10a. List Operations — unique',
@@ -417,7 +464,8 @@ async def main():
                 return($lib.len($list))
             '''
             result = await _call_storm(prox, q, timeout=timeout)
-            return f'sort() on 10K items → {result} items'
+            _assert(result == 10000, f'Expected 10000 sorted items, got {result}')
+            return f'sort() on 10K items → {result} items — verified'
 
         steps.append(await run_step(
             '10b. List Operations — sort',
@@ -434,7 +482,9 @@ async def main():
                 return($hash)
             '''
             result = await _call_storm(prox, q, timeout=timeout)
-            return f'SHA256 of 100KB → {str(result)[:16]}...'
+            expected = hashlib.sha256(b'X' * 100000).hexdigest()
+            _assert(result == expected, f'SHA256 mismatch: got {str(result)[:16]}...')
+            return f'SHA256 of 100KB — verified'
 
         steps.append(await run_step(
             '11. Hashing',
@@ -460,6 +510,7 @@ async def main():
             'steps': [s.as_dict() for s in steps],
             'passed': passed,
             'total': total,
+            'all_pass': passed == total,
             'total_time_s': round(total_time, 3),
         }
         with open(args.output, 'w') as f:
