@@ -8,12 +8,15 @@ tracking per-operation latency and reporting p50/p99/p999 percentiles.
 import argparse
 import asyncio
 import json
+import logging
 import os
 import random
 import signal
 import statistics
 import sys
 import time
+
+logger = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -62,7 +65,7 @@ def _make_write_query(idx):
 
 class Stats:
     __slots__ = ('read_lats', 'write_lats', 'read_errs', 'write_errs',
-                 'total_reads', 'total_writes', '_lock')
+                 'total_reads', 'total_writes', 'empty_reads', 'empty_writes', '_lock')
 
     def __init__(self):
         self.read_lats: list[float] = []
@@ -71,17 +74,23 @@ class Stats:
         self.write_errs = 0
         self.total_reads = 0
         self.total_writes = 0
+        self.empty_reads = 0
+        self.empty_writes = 0
         self._lock = asyncio.Lock()
 
-    async def record_read(self, latency):
+    async def record_read(self, latency, count):
         async with self._lock:
             self.read_lats.append(latency)
             self.total_reads += 1
+            if count == 0:
+                self.empty_reads += 1
 
-    async def record_write(self, latency):
+    async def record_write(self, latency, count):
         async with self._lock:
             self.write_lats.append(latency)
             self.total_writes += 1
+            if count == 0:
+                self.empty_writes += 1
 
     async def record_read_err(self):
         async with self._lock:
@@ -106,6 +115,8 @@ class Stats:
             'total_writes': self.total_writes,
             'read_errors': self.read_errs,
             'write_errors': self.write_errs,
+            'empty_reads': self.empty_reads,
+            'empty_writes': self.empty_writes,
         }
 
 
@@ -117,10 +128,12 @@ async def _read_loop(prox, tps, stats):
         idx += 1
         t0 = time.monotonic()
         try:
+            count = 0
             async for _ in prox.storm(query):
-                pass
-            await stats.record_read(time.monotonic() - t0)
-        except Exception:
+                count += 1
+            await stats.record_read(time.monotonic() - t0, count)
+        except Exception as e:
+            logger.warning('read error on query %r: %s', query, e)
             await stats.record_read_err()
         elapsed = time.monotonic() - t0
         sleep = interval - elapsed
@@ -136,10 +149,12 @@ async def _write_loop(prox, tps, stats):
         idx += 1
         t0 = time.monotonic()
         try:
+            count = 0
             async for _ in prox.storm(query):
-                pass
-            await stats.record_write(time.monotonic() - t0)
-        except Exception:
+                count += 1
+            await stats.record_write(time.monotonic() - t0, count)
+        except Exception as e:
+            logger.warning('write error on query %r: %s', query, e)
             await stats.record_write_err()
         elapsed = time.monotonic() - t0
         sleep = interval - elapsed
@@ -199,13 +214,65 @@ def _build_final_report(params, stats, all_read_lats, all_write_lats, elapsed):
             'mean_ms': round(statistics.mean(lats) * 1000, 2),
         }
 
+    s = stats.summary()
+    actual_read_tps = len(all_read_lats) / elapsed if elapsed > 0 else 0
+    actual_write_tps = len(all_write_lats) / elapsed if elapsed > 0 else 0
+
     return {
         'params': params,
         'elapsed_s': round(elapsed, 1),
-        **stats.summary(),
+        **s,
+        'actual_read_tps': round(actual_read_tps, 2),
+        'actual_write_tps': round(actual_write_tps, 2),
         'read_latency': _lat_stats(all_read_lats),
         'write_latency': _lat_stats(all_write_lats),
     }
+
+
+def _evaluate(report, args):
+    '''Check pass/fail criteria. Returns list of failure messages.'''
+    failures = []
+    total_ops = report['total_reads'] + report['total_writes']
+    total_errs = report['read_errors'] + report['write_errors']
+
+    # Error rate check
+    if total_ops > 0:
+        err_pct = (total_errs / total_ops) * 100
+        if err_pct > args.max_error_pct:
+            failures.append(f'error rate {err_pct:.2f}% exceeds {args.max_error_pct}%')
+    elif total_ops == 0:
+        failures.append('zero operations completed — test did not run')
+
+    # p99 latency check
+    for label, key in (('read', 'read_latency'), ('write', 'write_latency')):
+        lat = report.get(key, {})
+        p99 = lat.get('p99_ms', 0)
+        if p99 > args.max_p99_ms:
+            failures.append(f'{label} p99 {p99:.1f}ms exceeds {args.max_p99_ms}ms')
+
+    # Actual TPS vs target check
+    elapsed = report['elapsed_s']
+    if elapsed > 0:
+        target_read = args.read_tps
+        target_write = args.write_tps
+        for label, actual, target in (('read', report['actual_read_tps'], target_read),
+                                      ('write', report['actual_write_tps'], target_write)):
+            if target > 0:
+                achieved_pct = (actual / target) * 100
+                if achieved_pct < args.min_tps_pct:
+                    failures.append(f'{label} TPS {actual:.1f} is {achieved_pct:.0f}% of target {target} (min {args.min_tps_pct}%)')
+
+    # Vacuous pass detection
+    if report['empty_reads'] > 0:
+        empty_pct = (report['empty_reads'] / max(report['total_reads'], 1)) * 100
+        if empty_pct > 50:
+            failures.append(f'SUSPICIOUS: {empty_pct:.0f}% of reads returned 0 results ({report["empty_reads"]}/{report["total_reads"]})')
+    if report['empty_writes'] > 0:
+        empty_pct = (report['empty_writes'] / max(report['total_writes'], 1)) * 100
+        if empty_pct > 10:
+            failures.append(f'SUSPICIOUS: {empty_pct:.0f}% of writes returned 0 results ({report["empty_writes"]}/{report["total_writes"]})')
+
+    return failures
 
 
 def _print_final(report):
@@ -213,8 +280,9 @@ def _print_final(report):
     print('SOAK TEST COMPLETE')
     print('=' * 60)
     print(f'Duration: {report["elapsed_s"]:.1f}s')
-    print(f'Total reads:  {report["total_reads"]:>10}  errors: {report["read_errors"]}')
-    print(f'Total writes: {report["total_writes"]:>10}  errors: {report["write_errors"]}')
+    print(f'Total reads:  {report["total_reads"]:>10}  errors: {report["read_errors"]}  empty: {report["empty_reads"]}')
+    print(f'Total writes: {report["total_writes"]:>10}  errors: {report["write_errors"]}  empty: {report["empty_writes"]}')
+    print(f'Actual TPS:   read={report["actual_read_tps"]:.1f}  write={report["actual_write_tps"]:.1f}')
     for label, key in (('Read', 'read_latency'), ('Write', 'write_latency')):
         lat = report.get(key, {})
         if not lat:
@@ -226,6 +294,8 @@ def _print_final(report):
 
 
 async def main():
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s %(message)s')
+
     parser = argparse.ArgumentParser(
         description='Heavy soak test for multi-process Cortex.')
     parser.add_argument('url', help='Telepath URL (e.g. tcp://host:port/cortex)')
@@ -237,6 +307,14 @@ async def main():
                         help='Target write operations per second (default: 30)')
     parser.add_argument('--output', type=str, default=None,
                         help='Path to write JSON results')
+    parser.add_argument('--warmup', type=int, default=60,
+                        help='Warmup period in seconds excluded from stats (default: 60)')
+    parser.add_argument('--max-error-pct', type=float, default=1.0,
+                        help='Max error percentage before FAIL (default: 1.0)')
+    parser.add_argument('--max-p99-ms', type=float, default=5000.0,
+                        help='Max p99 latency in ms before FAIL (default: 5000)')
+    parser.add_argument('--min-tps-pct', type=float, default=50.0,
+                        help='Min achieved TPS as pct of target before FAIL (default: 50)')
     args = parser.parse_args()
 
     loop = asyncio.get_running_loop()
@@ -248,6 +326,10 @@ async def main():
         'duration': args.duration,
         'read_tps': args.read_tps,
         'write_tps': args.write_tps,
+        'warmup': args.warmup,
+        'max_error_pct': args.max_error_pct,
+        'max_p99_ms': args.max_p99_ms,
+        'min_tps_pct': args.min_tps_pct,
     }
 
     stats = Stats()
@@ -257,19 +339,42 @@ async def main():
     async with await s_telepath.openurl(args.url) as prox:
         print(f'Connected to {args.url}')
         print(f'Duration: {args.duration}s  Read TPS: {args.read_tps}  Write TPS: {args.write_tps}')
+        print(f'Warmup: {args.warmup}s  Thresholds: error<{args.max_error_pct}% p99<{args.max_p99_ms}ms tps>{args.min_tps_pct}%')
         print(f'Status updates every 60s. Ctrl+C for early stop.\n')
 
         t_start = time.monotonic()
 
+        # Warmup: run workloads but discard stats
+        if args.warmup > 0:
+            warmup_stats = Stats()
+            warmup_tasks = [
+                asyncio.create_task(_read_loop(prox, args.read_tps, warmup_stats)),
+                asyncio.create_task(_write_loop(prox, args.write_tps, warmup_stats)),
+            ]
+            try:
+                await asyncio.wait_for(_shutdown.wait(), timeout=args.warmup)
+            except asyncio.TimeoutError:
+                pass
+            for t in warmup_tasks:
+                t.cancel()
+            await asyncio.gather(*warmup_tasks, return_exceptions=True)
+            ws = warmup_stats.summary()
+            print(f'Warmup complete: {ws["total_reads"]} reads, {ws["total_writes"]} writes (discarded)\n')
+            if _shutdown.is_set():
+                print('Shutdown during warmup.')
+                return 1
+
+        t_measure = time.monotonic()
+
         tasks = [
             asyncio.create_task(_read_loop(prox, args.read_tps, stats)),
             asyncio.create_task(_write_loop(prox, args.write_tps, stats)),
-            asyncio.create_task(_reporter(stats, args.duration, t_start,
+            asyncio.create_task(_reporter(stats, args.duration, t_measure,
                                           all_read_lats, all_write_lats)),
         ]
 
         await asyncio.gather(*tasks, return_exceptions=True)
-        elapsed = time.monotonic() - t_start
+        elapsed = time.monotonic() - t_measure
 
     # Flush any remaining latencies not yet collected by reporter
     rl, wl = await stats.snapshot_and_reset()
@@ -279,11 +384,22 @@ async def main():
     report = _build_final_report(params, stats, all_read_lats, all_write_lats, elapsed)
     _print_final(report)
 
+    # --- Pass/fail evaluation ---
+    failures = _evaluate(report, args)
+
     if args.output:
+        report['failures'] = failures
         with open(args.output, 'w') as f:
             json.dump(report, f, indent=2)
         print(f'\nJSON written to {args.output}')
 
+    if failures:
+        print(f'\nFAIL — {len(failures)} check(s) failed:')
+        for msg in failures:
+            print(f'  ✗ {msg}')
+        return 1
+
+    print('\nPASS — all checks passed.')
     return 0
 
 
