@@ -60,6 +60,9 @@ def _build_seed_queries():
     # Sentinel node — written last, used to verify replication completeness
     queries.append(f'[ inet:fqdn={SENTINEL_FQDN} ]')
 
+    # Leaf node for delete rejection test (no inbound references)
+    queries.append('[ inet:ipv4=10.0.0.99 ]')
+
     return queries
 
 
@@ -176,7 +179,7 @@ WRITE_REJECTION_QUERIES = [
     ('add_node',        '[ inet:fqdn=reject.test.com ]'),
     ('set_node_data',   'inet:fqdn=host0.test.com $node.data.set(x, 1)'),
     ('add_tag',         'inet:fqdn=host0.test.com [ +#reject.tag ]'),
-    ('del_node',        'inet:fqdn=host0.test.com | delnode'),
+    ('del_node',        'inet:ipv4=10.0.0.99 | delnode'),
 ]
 
 

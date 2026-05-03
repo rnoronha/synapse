@@ -1,0 +1,72 @@
+Connected to tcp://127.0.0.1:27492/cortex
+Duration: 3600s, 1 read + 1 write per second
+[60s] reads=61 r_err=0 r_p50=2.2ms r_p99=2.6ms | writes=61 w_err=0 w_p50=3.9ms w_p99=4.8ms
+[120s] reads=121 r_err=0 r_p50=2.2ms r_p99=2.4ms | writes=121 w_err=0 w_p50=3.9ms w_p99=4.7ms
+[180s] reads=181 r_err=0 r_p50=2.2ms r_p99=2.8ms | writes=181 w_err=0 w_p50=3.9ms w_p99=4.6ms
+[240s] reads=241 r_err=0 r_p50=2.2ms r_p99=2.4ms | writes=241 w_err=0 w_p50=3.9ms w_p99=4.7ms
+[300s] reads=301 r_err=0 r_p50=2.1ms r_p99=2.4ms | writes=301 w_err=0 w_p50=3.9ms w_p99=4.6ms
+[360s] reads=361 r_err=0 r_p50=2.2ms r_p99=61.0ms | writes=361 w_err=0 w_p50=3.9ms w_p99=4.7ms
+[421s] reads=421 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=421 w_err=0 w_p50=3.8ms w_p99=4.3ms
+[481s] reads=481 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=481 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[541s] reads=541 r_err=0 r_p50=2.2ms r_p99=2.9ms | writes=541 w_err=0 w_p50=3.7ms w_p99=4.1ms
+[601s] reads=601 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=601 w_err=0 w_p50=3.7ms w_p99=4.1ms
+[661s] reads=661 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=661 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[721s] reads=721 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=721 w_err=0 w_p50=3.8ms w_p99=4.2ms
+[781s] reads=781 r_err=0 r_p50=2.2ms r_p99=3.1ms | writes=781 w_err=0 w_p50=3.8ms w_p99=4.2ms
+[841s] reads=841 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=841 w_err=0 w_p50=3.8ms w_p99=4.2ms
+[901s] reads=901 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=901 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[961s] reads=961 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=961 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[1021s] reads=1021 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=1021 w_err=0 w_p50=3.8ms w_p99=4.2ms
+[1081s] reads=1081 r_err=0 r_p50=2.2ms r_p99=2.9ms | writes=1081 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1142s] reads=1141 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=1141 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1202s] reads=1201 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=1201 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1262s] reads=1261 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=1261 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[1322s] reads=1321 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=1321 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1382s] reads=1381 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=1381 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1442s] reads=1441 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=1441 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1502s] reads=1501 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=1501 w_err=0 w_p50=3.7ms w_p99=4.1ms
+[1562s] reads=1561 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=1561 w_err=0 w_p50=3.7ms w_p99=4.0ms
+[1622s] reads=1621 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=1621 w_err=0 w_p50=3.8ms w_p99=4.2ms
+[1682s] reads=1681 r_err=0 r_p50=2.2ms r_p99=2.9ms | writes=1681 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1742s] reads=1741 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=1741 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1803s] reads=1801 r_err=0 r_p50=2.2ms r_p99=2.9ms | writes=1801 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[1863s] reads=1861 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=1861 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[1923s] reads=1921 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=1921 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[1983s] reads=1981 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=1981 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[2043s] reads=2041 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=2041 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[2103s] reads=2101 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=2101 w_err=0 w_p50=3.7ms w_p99=82.0ms
+[2163s] reads=2161 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=2161 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[2223s] reads=2221 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2221 w_err=0 w_p50=3.7ms w_p99=4.0ms
+[2283s] reads=2281 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2281 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[2343s] reads=2341 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2341 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[2403s] reads=2401 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2401 w_err=0 w_p50=3.7ms w_p99=4.1ms
+[2463s] reads=2461 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=2461 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[2524s] reads=2521 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2521 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[2584s] reads=2581 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2581 w_err=0 w_p50=3.8ms w_p99=4.2ms
+[2644s] reads=2641 r_err=0 r_p50=2.2ms r_p99=3.1ms | writes=2641 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[2704s] reads=2701 r_err=0 r_p50=2.2ms r_p99=3.1ms | writes=2701 w_err=0 w_p50=3.8ms w_p99=4.2ms
+[2764s] reads=2761 r_err=0 r_p50=2.2ms r_p99=3.1ms | writes=2761 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[2824s] reads=2821 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2821 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[2884s] reads=2881 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2881 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[2944s] reads=2941 r_err=0 r_p50=2.1ms r_p99=3.0ms | writes=2941 w_err=0 w_p50=3.8ms w_p99=4.0ms
+[3004s] reads=3001 r_err=0 r_p50=2.2ms r_p99=3.1ms | writes=3001 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3064s] reads=3061 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=3061 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3124s] reads=3121 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=3121 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3184s] reads=3181 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=3181 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3245s] reads=3241 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=3241 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3305s] reads=3301 r_err=0 r_p50=2.2ms r_p99=3.0ms | writes=3301 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3365s] reads=3361 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=3361 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3425s] reads=3421 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=3421 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3485s] reads=3481 r_err=0 r_p50=2.2ms r_p99=2.9ms | writes=3481 w_err=0 w_p50=3.8ms w_p99=4.1ms
+[3545s] reads=3541 r_err=0 r_p50=2.1ms r_p99=2.9ms | writes=3541 w_err=0 w_p50=3.8ms w_p99=4.1ms
+
+============================================================
+SOAK TEST COMPLETE
+============================================================
+Duration: 3600.0s
+Total reads:  3595  errors: 0
+Total writes: 3595  errors: 0
+Error rate: 0.000%
+Read latency  (3595 ops): min=2.0ms p50=2.2ms p99=3.0ms max=145.3ms mean=2.3ms
+Write latency (3595 ops): min=3.5ms p50=3.8ms p99=4.2ms max=194.1ms mean=3.9ms
+

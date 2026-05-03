@@ -1525,7 +1525,7 @@ class Layer(s_nexus.Pusher):
         self.activetasks = []
 
         # this must be last!
-        self.readonly = layrinfo.get('readonly')
+        self.readonly = layrinfo.get('readonly') or self.core.readonly
 
     def _getBuidCacheSize(self):
         '''
