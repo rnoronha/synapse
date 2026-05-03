@@ -34,7 +34,7 @@ CONDITIONS = [
     ('low',       1,  None),
     ('medium',   10,  None),
     ('high',     50,  None),
-    ('sustained', 10, 3600),
+    ('sustained', 10, None),
 ]
 
 _shutdown = asyncio.Event()

@@ -409,7 +409,7 @@ case $TEST in
         fi
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_recovery.py $WRITER_URL $READER_PORTS_FLAG $OUTPUT_FLAG";;
     read-after-write)
-        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_read_after_write.py $WRITER_URL $OUTPUT_FLAG";;
+        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_read_after_write.py $WRITER_URL --duration $DURATION $OUTPUT_FLAG";;
     parallel-reads)
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_parallel_reads.py $WRITER_URL --concurrency 64 $OUTPUT_FLAG";;
     mixed-load)
@@ -418,6 +418,10 @@ esac
 
 # Soak tests need a longer SSM timeout
 SSM_TIMEOUT=$((DURATION + 300))
+# read-after-write runs 4 conditions × DURATION
+if [[ "$TEST" == "read-after-write" ]]; then
+    SSM_TIMEOUT=$((DURATION * 4 + 300))
+fi
 if [[ $SSM_TIMEOUT -lt 600 ]]; then
     SSM_TIMEOUT=600
 fi
