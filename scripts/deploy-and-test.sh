@@ -99,6 +99,11 @@ cleanup() {
 trap cleanup EXIT
 
 # ── helper: run command via SSM ───────────────────────────────────────
+# Stdout  → captured StandardOutputContent (always, success or failure)
+# Stderr  → printed to fd2 (visible in terminal, not captured by $())
+# Returns → SSM exit status (0=Success, 1=Failed/TimedOut/Cancelled)
+# NOTE: SSM StandardOutputContent is capped at 24KB. Tests write results
+#       to /tmp/test-results.json and we fetch that file separately.
 run_ssm() {
     local cmd="$1"
     local timeout="${2:-600}"
@@ -123,12 +128,19 @@ run_ssm() {
         case $status in
             Success)  break;;
             Failed|TimedOut|Cancelled)
-                echo "ERROR: SSM command failed (status=$status)"
+                echo "ERROR: SSM command failed (status=$status)" >&2
+                # Print stderr to terminal
                 aws ssm get-command-invocation \
                     --region "$REGION" \
                     --command-id "$cmd_id" \
                     --instance-id "$INSTANCE_ID" \
-                    --query '[StandardOutputContent, StandardErrorContent]' --output text
+                    --query StandardErrorContent --output text >&2
+                # Still emit stdout so callers can capture it
+                aws ssm get-command-invocation \
+                    --region "$REGION" \
+                    --command-id "$cmd_id" \
+                    --instance-id "$INSTANCE_ID" \
+                    --query StandardOutputContent --output text
                 return 1;;
             *) ;;  # InProgress, Pending, etc — keep polling
         esac
@@ -314,20 +326,40 @@ fi
 
 echo "Running: $TEST_CMD"
 echo "─────────────────────────────────────────────────────────"
+set +e
 TEST_OUTPUT=$(run_ssm "$TEST_CMD" "$SSM_TIMEOUT")
+TEST_EXIT=$?
+set -e
 echo "$TEST_OUTPUT"
+if [[ $TEST_EXIT -ne 0 ]]; then
+    echo "WARNING: test exited with status $TEST_EXIT"
+fi
 echo "─────────────────────────────────────────────────────────"
 
-# Fetch JSON results if produced
+# Always fetch JSON results (written to file, immune to 24KB SSM stdout cap)
 echo ""
 RESULTS_JSON=$(run_ssm "cat /tmp/test-results.json 2>/dev/null || echo '{}'" | tr -d '\n')
 if [[ "$RESULTS_JSON" != "{}" ]]; then
     mkdir -p results
     echo "$RESULTS_JSON" > "results/${TEST}-results.json"
     echo "Results saved to results/${TEST}-results.json"
+else
+    echo "WARNING: No results JSON produced"
+fi
+
+# Dump cortex log tail for diagnostics on failure
+if [[ $TEST_EXIT -ne 0 ]]; then
+    echo ""
+    echo "── CORTEX LOG (last 30 lines) ─────────────────────────────"
+    run_ssm "tail -30 /tmp/cortex.log" || true
 fi
 
 echo ""
 echo "═══════════════════════════════════════════════════════════"
-echo "  COMPLETE — $TEST test finished"
+if [[ $TEST_EXIT -eq 0 ]]; then
+    echo "  PASS — $TEST test finished"
+else
+    echo "  FAIL — $TEST test exited $TEST_EXIT"
+fi
 echo "═══════════════════════════════════════════════════════════"
+exit $TEST_EXIT
