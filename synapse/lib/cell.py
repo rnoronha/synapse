@@ -4696,6 +4696,10 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         datadir = fork_info['datadir']
         count = fork_info['count']
 
+        # E-1 fix: The init event loop is dead. Null out the stale loop
+        # reference so nothing accidentally uses it between phases.
+        cell.loop = None
+
         def _worker_entry(listen_sock, uds_path_arg, worker_id):
             s_worker.worker_main(listen_sock, uds_path_arg, datadir)
 
@@ -4704,6 +4708,15 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
 
         # Phase 3: Writer process creates a new event loop and serves
         async def _writer_serve():
+
+            # E-1 fix: Rebind the cell to the new running event loop.
+            cell.loop = asyncio.get_running_loop()
+
+            # S-1 fix: Replace the raw signal.signal SIGCHLD handler with
+            # a loop-based handler so restarts happen from the event loop,
+            # not inside a signal handler (which is undefined behavior).
+            arbiter.install_loop_signal_handler(cell.loop)
+
             # Clear stale server refs and UDS files from the init loop
             cell.dmon.listenservers.clear()
             for spath in (os.path.join(cell.dirn, 'sock'), uds_path):

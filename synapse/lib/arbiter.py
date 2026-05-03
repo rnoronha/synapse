@@ -22,15 +22,59 @@ SHUTDOWN_GRACE = 5.0
 # Seconds between waitpid polls during shutdown drain.
 SHUTDOWN_POLL = 0.1
 
+# Seconds to wait for memlock threads to exit before fork.
+MEMLOCK_JOIN_TIMEOUT = 5.0
+
+
+def _stop_memlock_threads():
+    '''Signal all slab memlock threads to stop and wait for them to exit.
+
+    Must be called before _close_all_slabs() and before fork() so that no
+    background threads are alive when we fork.
+    '''
+    slabs_with_memlock = [
+        slab for slab in s_lmdbslab.Slab.allslabs.values()
+        if slab.memlocktask is not None
+    ]
+    if not slabs_with_memlock:
+        return
+
+    # Signal all memlock threads to exit
+    for slab in slabs_with_memlock:
+        slab.isfini = True
+        slab.resizeevent.set()
+
+    # Wait for threads to finish (they check isfini and will exit)
+    deadline = time.monotonic() + MEMLOCK_JOIN_TIMEOUT
+    for slab in slabs_with_memlock:
+        remaining = max(0, deadline - time.monotonic())
+        # The memlocktask is a Future wrapping a thread executor call.
+        # We can't await it (no event loop), but the underlying thread
+        # will exit because we set isfini=True and signaled resizeevent.
+        # Wait by polling the thread pool — the thread checks isfini on
+        # each iteration of its loop.
+        while not slab.memlocktask.done() and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        if not slab.memlocktask.done():
+            logger.warning('Memlock thread for %s did not exit in time', slab.path)
+        else:
+            logger.debug('Memlock thread for %s stopped', slab.path)
+
 
 def _close_all_slabs():
-    '''Close every open LMDB environment so children don't inherit parent mmaps.'''
+    '''Close every open LMDB environment so children don't inherit parent mmaps.
+
+    Closes the lenv handles but preserves slab entries in allslabs so that
+    forked workers can discover slab paths for readonly re-open.
+    '''
     for slab in list(s_lmdbslab.Slab.allslabs.values()):
         try:
             slab.lenv.close()
         except Exception:
             logger.warning('Failed to close slab %s pre-fork', slab.path, exc_info=True)
-    s_lmdbslab.Slab.allslabs.clear()
+    # NOTE: Do NOT clear allslabs here. Workers need the slab metadata
+    # (paths) to re-open in readonly mode. See L-1 fix.
 
 
 class Arbiter:
@@ -43,6 +87,8 @@ class Arbiter:
         self._num_workers = 0
         self._worker_main = None
         self._shutdown_flag = False
+        self._pending_restarts = []  # (slot_idx,) tuples queued by SIGCHLD handler
+        self._loop = None  # set by install_loop_signal_handler
 
     def fork_workers(self, num_workers, listen_sock, uds_path, worker_main):
         '''
@@ -53,7 +99,7 @@ class Arbiter:
 
         Args:
             num_workers: Number of worker processes to fork.
-            listen_sock: The bound/listening ``socket.socket`` workers inherit.
+            listen_sock: The bound/listening socket fd workers inherit.
             uds_path: Filesystem path of the writer's UDS endpoint.
             worker_main: Callable ``worker_main(listen_sock, uds_path, worker_id)``
                          invoked in each child.  Must not return (call ``os._exit``).
@@ -66,6 +112,7 @@ class Arbiter:
         self._num_workers = num_workers
         self._worker_main = worker_main
 
+        _stop_memlock_threads()
         _close_all_slabs()
 
         self._install_parent_signals()
@@ -111,7 +158,12 @@ class Arbiter:
         signal.signal(signal.SIGCHLD, self._handle_sigchld)
 
     def _handle_sigchld(self, signum, frame):
-        '''Reap exited children and schedule respawn for crashed workers.'''
+        '''Reap exited children and queue restarts (signal-safe).
+
+        This handler only reaps via waitpid and records which slots need
+        restart.  Actual fork happens in process_pending_restarts() which
+        runs from the event loop, not from a signal handler.
+        '''
         while True:
             try:
                 pid, status = os.waitpid(-1, os.WNOHANG)
@@ -132,7 +184,31 @@ class Arbiter:
                     logger.error('Worker pid %d exited with code %d', pid, code)
 
                 if not self._shutdown_flag:
-                    self.restart_worker(idx)
+                    self._pending_restarts.append(idx)
+
+    def install_loop_signal_handler(self, loop):
+        '''Install an async-safe SIGCHLD handler on the event loop.
+
+        Replaces the raw signal.signal handler with loop.add_signal_handler
+        so that SIGCHLD wakes the event loop and restarts are processed
+        safely (not inside a signal handler).
+        '''
+        self._loop = loop
+
+        def _on_sigchld():
+            # Reap children (async-signal-safe part)
+            self._handle_sigchld(signal.SIGCHLD, None)
+            # Schedule restarts from the event loop (safe to fork here)
+            self.process_pending_restarts()
+
+        loop.add_signal_handler(signal.SIGCHLD, _on_sigchld)
+
+    def process_pending_restarts(self):
+        '''Fork new workers for any slots that died.  Must be called from
+        the main thread (not from a signal handler).'''
+        while self._pending_restarts:
+            idx = self._pending_restarts.pop(0)
+            self.restart_worker(idx)
 
     # ------------------------------------------------------------------
     # restart / shutdown

@@ -142,25 +142,26 @@ def worker_main(listening_sock_fd, uds_path, datadir):
 
 
 def _reopen_lmdb_readonly(datadir):
-    '''Close inherited LMDB envs and re-open them in readonly mode.'''
-    slabs = list(s_lmdbslab.Slab.allslabs.values())
-    for slab in slabs:
-        path = slab.path
-        slab.lenv.close()
-        s_lmdbslab.Slab.allslabs.pop(path, None)
+    '''Re-open inherited LMDB slabs in readonly mode.
 
-        # Re-open fresh in readonly mode against the same files
-        mapsize = os.path.getsize(os.path.join(path, 'data.mdb'))
+    The parent arbiter already closed the lenv handles before fork, so we
+    must NOT close them again (double-close).  We just collect the paths
+    from the inherited allslabs metadata, clear the stale entries, and
+    re-open fresh readonly environments.
+    '''
+    paths = [slab.path for slab in s_lmdbslab.Slab.allslabs.values()]
+    s_lmdbslab.Slab.allslabs.clear()
+
+    for path in paths:
         env = lmdb.open(
             str(path),
-            map_size=mapsize,
+            map_size=0,  # use current file size; avoids MDB_MAP_RESIZED
             max_dbs=128,
             max_readers=256,
             readonly=True,
             create=False,
-            readahead=True,
+            readahead=False,
         )
-        # Stash the env so the worker can use it; keyed by path for lookup
         _readonly_envs[path] = env
 
 
