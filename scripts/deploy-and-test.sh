@@ -20,6 +20,7 @@ REGION="us-east-1"
 S3_BUCKET="rodrigon-testing-artifacts"
 S3_KEY="synapse-deploy-$$.tar.gz"
 DATADIR="/tmp/cortex-data"
+DATA_SNAPSHOT=""
 
 # ── hardcoded infra (from provision-test-infra.sh) ────────────────────
 AMI="ami-0e1e769742d1cfb49"
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
         --instance-type) INSTANCE_TYPE="$2"; shift 2;;
         --duration)      DURATION="$2";      shift 2;;
         --region)        REGION="$2";        shift 2;;
+        --data-snapshot) DATA_SNAPSHOT="$2"; shift 2;;
         *) echo "Unknown arg: $1"; exit 1;;
     esac
 done
@@ -54,6 +56,7 @@ if [[ -z "$TEST" ]]; then
     echo "  --instance-type <type>  EC2 instance type (default: c5.4xlarge)"
     echo "  --duration <secs>       Soak test duration (default: 600)"
     echo "  --region <region>       AWS region (default: us-east-1)"
+    echo "  --data-snapshot <id>    EBS snapshot with pre-seeded test data"
     exit 1
 fi
 
@@ -82,6 +85,9 @@ echo "  Test:     $TEST"
 echo "  Readers:  $READERS"
 echo "  Instance: $INSTANCE_TYPE"
 echo "  Region:   $REGION"
+if [[ -n "$DATA_SNAPSHOT" ]]; then
+echo "  Snapshot: $DATA_SNAPSHOT"
+fi
 echo "═══════════════════════════════════════════════════════════"
 
 # ── cleanup trap ──────────────────────────────────────────────────────
@@ -91,6 +97,11 @@ cleanup() {
     if [[ -n "$INSTANCE_ID" ]]; then
         echo "Terminating instance $INSTANCE_ID..."
         aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID" --output text >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${SNAP_VOL_ID:-}" ]]; then
+        echo "Waiting for instance termination to release volume..."
+        sleep 30
+        aws ec2 delete-volume --region "$REGION" --volume-id "$SNAP_VOL_ID" 2>/dev/null || true
     fi
     aws s3 rm "s3://$S3_BUCKET/$S3_KEY" >/dev/null 2>&1 || true
     rm -f /tmp/synapse-deploy.tar.gz
@@ -153,6 +164,27 @@ run_ssm() {
         --query StandardOutputContent --output text
 }
 
+
+# ── AUTO-RESOLVE ARTIFACT ─────────────────────────────────────────────
+if [[ -z "$ARTIFACT" ]]; then
+    # Map branch name to artifact prefix
+    case "$BRANCH" in
+        master)                  ARTIFACT_PREFIX="synapse-master" ;;
+        g3-piecemeal-fixes)      ARTIFACT_PREFIX="synapse-g3-g3" ;;
+        phase2-multi-process)    ARTIFACT_PREFIX="synapse-phase2" ;;
+        *)                       ARTIFACT_PREFIX="synapse-$(echo $BRANCH | tr / -)" ;;
+    esac
+    # Find the latest artifact matching the prefix
+    ARTIFACT=$(aws s3 ls "s3://$S3_BUCKET/" --region "$REGION" 2>/dev/null \
+        | grep "$ARTIFACT_PREFIX" | sort -k1,2 | tail -1 | awk "{print \$4}")
+    if [[ -n "$ARTIFACT" ]]; then
+        ARTIFACT="s3://$S3_BUCKET/$ARTIFACT"
+        echo "Auto-resolved artifact: $ARTIFACT"
+    else
+        echo "WARNING: No artifact found for prefix $ARTIFACT_PREFIX in s3://$S3_BUCKET/"
+        echo "Building from git instead..."
+    fi
+fi
 # ── PHASE 1: PROVISION ────────────────────────────────────────────────
 echo ""
 echo "── PHASE 1: PROVISION ─────────────────────────────────────"
@@ -186,6 +218,39 @@ for i in $(seq 1 60); do
     fi
     sleep 5
 done
+
+# ── PHASE 1b: ATTACH SNAPSHOT VOLUME (if --data-snapshot) ─────────────
+if [[ -n "$DATA_SNAPSHOT" ]]; then
+    echo ""
+    echo "── PHASE 1b: SNAPSHOT VOLUME ──────────────────────────────"
+    DATADIR="/mnt/cortex-data"
+
+    AZ=$(aws ec2 describe-instances \
+        --region "$REGION" \
+        --instance-ids "$INSTANCE_ID" \
+        --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+
+    SNAP_VOL_ID=$(aws ec2 create-volume \
+        --region "$REGION" \
+        --availability-zone "$AZ" \
+        --snapshot-id "$DATA_SNAPSHOT" \
+        --volume-type gp3 \
+        --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=synapse-test-snap-$$}]" \
+        --query VolumeId --output text)
+
+    echo "Volume $SNAP_VOL_ID from snapshot $DATA_SNAPSHOT"
+    aws ec2 wait volume-available --region "$REGION" --volume-ids "$SNAP_VOL_ID"
+
+    aws ec2 attach-volume \
+        --region "$REGION" \
+        --volume-id "$SNAP_VOL_ID" \
+        --instance-id "$INSTANCE_ID" \
+        --device /dev/xvdf --output text >/dev/null
+
+    sleep 10
+    run_ssm "sudo mkdir -p $DATADIR && sudo mount /dev/xvdf $DATADIR && sudo chown ec2-user:ec2-user $DATADIR"
+    echo "Snapshot data mounted at $DATADIR"
+fi
 
 # ── PHASE 2: SETUP ────────────────────────────────────────────────────
 echo ""
@@ -261,7 +326,11 @@ echo ""
 echo "── PHASE 4: START CORTEX ──────────────────────────────────"
 
 echo "Killing any existing cortex..."
-run_ssm "pkill -f 'synapse.servers.cortex' || true; sleep 2; rm -rf $DATADIR; mkdir -p $DATADIR"
+if [[ -n "$DATA_SNAPSHOT" ]]; then
+    run_ssm "pkill -f 'synapse.servers.cortex' || true; sleep 2"
+else
+    run_ssm "pkill -f 'synapse.servers.cortex' || true; sleep 2; rm -rf $DATADIR; mkdir -p $DATADIR"
+fi
 
 echo "Writing cell.yaml (readers=$READERS)..."
 if [[ "$READERS" -gt 0 ]]; then
@@ -379,7 +448,7 @@ fi
 # Dump cortex log tail for diagnostics on failure
 if [[ $TEST_EXIT -ne 0 ]]; then
     echo ""
-    echo "── CORTEX LOG (last 30 lines) ─────────────────────────────"
+    echo "-- CORTEX LOG (last 30 lines) -----------------------------"
     run_ssm "tail -30 /tmp/cortex.log" || true
 fi
 
