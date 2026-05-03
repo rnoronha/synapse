@@ -117,18 +117,28 @@ async def _seed_if_empty(prox, timeout):
             pass
 
     # inet:fqdn with .seen intervals — for interval lift tests
+    # Ensure >=50 nodes overlap the query range ("2023-06-01","2023-06-02")
     for i in range(SEED_FQDN_IVAL):
-        month = (i % 12) + 1
-        q = f'[ inet:fqdn=ival{i}.pathbench.com .seen=("2023-{month:02d}-01","2023-{month:02d}-28") ]'
+        if i < 60:
+            # First 60: .seen spans that include June 1
+            q = f'[ inet:fqdn=ival{i}.pathbench.com .seen=("2023-05-28","2023-06-05") ]'
+        else:
+            month = (i % 12) + 1
+            q = f'[ inet:fqdn=ival{i}.pathbench.com .seen=("2023-{month:02d}-01","2023-{month:02d}-28") ]'
         async for _ in prox.storm(q):
             pass
 
     # geo:place with latlong — for geospatial tests
+    # Seed >=50 points near LA (34.1, -118.3) plus global scatter
     import random
     rng = random.Random(42)
     for i in range(SEED_GEO):
-        lat = rng.uniform(-90, 90)
-        lon = rng.uniform(-180, 180)
+        if i < 80:
+            lat = rng.uniform(32, 36)
+            lon = rng.uniform(-120, -116)
+        else:
+            lat = rng.uniform(-90, 90)
+            lon = rng.uniform(-180, 180)
         q = f'[ geo:place=* :latlong="{lat},{lon}" :name=geotest{i} ]'
         async for _ in prox.storm(q):
             pass
