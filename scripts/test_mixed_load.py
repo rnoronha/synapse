@@ -9,11 +9,14 @@ Reports per-type latency percentiles and optional JSON output.
 import argparse
 import asyncio
 import json
+import logging
 import os
 import random
 import signal
 import sys
 import time
+
+log = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -113,6 +116,7 @@ async def _run_op(prox, sem, stats, write_pct):
                 pass
             await stats.record(kind, time.monotonic() - t0)
         except Exception:
+            log.warning('Op %s failed: %s', kind, query, exc_info=True)
             await stats.record_error()
 
 
@@ -152,6 +156,10 @@ async def main():
                         help='Test duration in seconds (default: 60)')
     parser.add_argument('--output', type=str, default=None,
                         help='Path to write JSON results')
+    parser.add_argument('--max-error-pct', type=float, default=1.0,
+                        help='Max error rate %% before FAIL (default: 1.0)')
+    parser.add_argument('--max-p99-ms', type=float, default=None,
+                        help='Max p99 latency (ms) before FAIL (default: no limit)')
     args = parser.parse_args()
 
     loop = asyncio.get_running_loop()
@@ -271,8 +279,40 @@ async def main():
             json.dump(report, f, indent=2)
         print(f'\nJSON written to {args.output}')
 
+    # --- Pass/fail evaluation ---
+    failures: list[str] = []
+
+    # Vacuous pass: no ops completed at all
+    if total_ops == 0:
+        failures.append('FAIL: 0 operations completed (vacuous pass)')
+
+    # Error rate threshold
+    if total_ops > 0:
+        error_pct = (stats.errors / total_ops) * 100
+        if error_pct > args.max_error_pct:
+            failures.append(
+                f'FAIL: error rate {error_pct:.1f}% exceeds --max-error-pct {args.max_error_pct}%'
+            )
+
+    # Latency threshold
+    if args.max_p99_ms is not None:
+        for label, lats in (('read', all_read_lats), ('write', all_write_lats)):
+            if lats:
+                p99 = _percentile(lats, 99) * 1000
+                if p99 > args.max_p99_ms:
+                    failures.append(
+                        f'FAIL: {label} p99 {p99:.1f}ms exceeds --max-p99-ms {args.max_p99_ms}ms'
+                    )
+
+    if failures:
+        print('\n' + '\n'.join(failures))
+        print('\nRESULT: FAIL')
+        return 1
+
+    print('\nRESULT: PASS')
     return 0
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s %(message)s')
     sys.exit(asyncio.run(main()))
