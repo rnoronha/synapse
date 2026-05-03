@@ -17,7 +17,7 @@ INSTANCE_TYPE="c5.4xlarge"
 DURATION=600
 REGION="us-east-1"
 S3_BUCKET="rodrigon-testing-artifacts"
-S3_KEY="synapse-deploy.tar.gz"
+S3_KEY="synapse-deploy-$$.tar.gz"
 DATADIR="/tmp/cortex-data"
 
 # ── hardcoded infra (from provision-test-infra.sh) ────────────────────
