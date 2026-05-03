@@ -198,8 +198,8 @@ async def main():
         description='Correctness test for multi-process Cortex read/write split.')
     parser.add_argument('--writer', required=True,
                         help='Telepath URL for the writer Cortex')
-    parser.add_argument('--reader', required=True,
-                        help='Telepath URL for the reader Cortex')
+    parser.add_argument('--reader', default=None,
+                        help='Telepath URL for the reader Cortex (omit for single-process mode)')
     parser.add_argument('--output', type=str, default=None,
                         help='Path to write JSON results')
     args = parser.parse_args()
@@ -208,96 +208,127 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
-    async with await s_telepath.openurl(args.writer) as writer, \
-               await s_telepath.openurl(args.reader) as reader:
+    single_mode = args.reader is None
 
-        # --- Seed ---
-        print('Seeding test data through writer...', flush=True)
-        t0 = time.monotonic()
-        await _seed(writer)
-        seed_time = time.monotonic() - t0
-        print(f'  Seeded in {seed_time:.2f}s')
+    if single_mode:
+        print('Single-process mode: recording baseline query results (no reader comparison)')
 
-        # Allow reader to pick up seeded data
-        await asyncio.sleep(6)
+    async with await s_telepath.openurl(args.writer) as writer:
 
-        # --- Read queries ---
-        print(f'\nRunning {len(READ_QUERIES)} read queries against both endpoints...')
-        read_results = []
+        reader_ctx = None
+        reader = None
+        if not single_mode:
+            reader_ctx = await s_telepath.openurl(args.reader)
+            reader = await reader_ctx.__aenter__()
 
-        for name, mode, query in READ_QUERIES:
-            if _shutdown.is_set():
-                break
+        try:
+            # --- Seed ---
+            print('Seeding test data through writer...', flush=True)
+            t0 = time.monotonic()
+            await _seed(writer)
+            seed_time = time.monotonic() - t0
+            print(f'  Seeded in {seed_time:.2f}s')
 
-            w_result = await _run_read_query(writer, mode, query)
-            r_result = await _run_read_query(reader, mode, query)
-            match = _compare(w_result, r_result, mode, name)
+            if not single_mode:
+                await asyncio.sleep(6)
 
-            status = 'PASS' if match else 'FAIL'
-            print(f'  [{status}] {name}')
+            # --- Read queries ---
+            if single_mode:
+                print(f'\nRunning {len(READ_QUERIES)} read queries against writer...')
+            else:
+                print(f'\nRunning {len(READ_QUERIES)} read queries against both endpoints...')
+            read_results = []
 
-            result = {
-                'name': name,
-                'query': query,
-                'pass': match,
-                'writer_count': len(w_result),
-                'reader_count': len(r_result),
+            for name, mode, query in READ_QUERIES:
+                if _shutdown.is_set():
+                    break
+
+                w_result = await _run_read_query(writer, mode, query)
+
+                if single_mode:
+                    print(f'  [RECORDED] {name}')
+                    read_results.append({
+                        'name': name,
+                        'query': query,
+                        'pass': True,
+                        'writer_count': len(w_result),
+                        'reader_count': None,
+                    })
+                else:
+                    r_result = await _run_read_query(reader, mode, query)
+                    match = _compare(w_result, r_result, mode, name)
+                    status = 'PASS' if match else 'FAIL'
+                    print(f'  [{status}] {name}')
+                    result = {
+                        'name': name,
+                        'query': query,
+                        'pass': match,
+                        'writer_count': len(w_result),
+                        'reader_count': len(r_result),
+                    }
+                    if not match:
+                        result['writer_sample'] = w_result[:5]
+                        result['reader_sample'] = r_result[:5]
+                    read_results.append(result)
+
+            # --- Write rejection ---
+            rejection_results = []
+            if single_mode:
+                print(f'\nSkipping {len(WRITE_REJECTION_QUERIES)} write rejection tests (no reader)')
+            else:
+                print(f'\nRunning {len(WRITE_REJECTION_QUERIES)} write rejection tests on reader...')
+                for name, query in WRITE_REJECTION_QUERIES:
+                    if _shutdown.is_set():
+                        break
+                    result = await _test_write_rejection(reader, name, query)
+                    status = 'PASS' if result['pass'] else 'FAIL'
+                    print(f'  [{status}] {name}')
+                    rejection_results.append(result)
+
+            # --- Summary ---
+            read_passed = sum(1 for r in read_results if r['pass'])
+            read_total = len(read_results)
+            reject_passed = sum(1 for r in rejection_results if r['pass'])
+            reject_total = len(rejection_results)
+            all_passed = (read_passed == read_total) and (reject_passed == reject_total)
+
+            print(f'\n{"=" * 50}')
+            print(f'Read queries:      {read_passed}/{read_total} passed')
+            if single_mode:
+                print(f'Write rejections:  skipped (single-process mode)')
+            else:
+                print(f'Write rejections:  {reject_passed}/{reject_total} passed')
+            print(f'Overall:           {"PASS" if all_passed else "FAIL"}')
+
+            # --- JSON output ---
+            report = {
+                'overall': 'PASS' if all_passed else 'FAIL',
+                'seed_time': round(seed_time, 3),
+                'single_mode': single_mode,
+                'read_queries': {
+                    'passed': read_passed,
+                    'total': read_total,
+                    'results': read_results,
+                },
+                'write_rejections': {
+                    'passed': reject_passed,
+                    'total': reject_total,
+                    'results': rejection_results,
+                },
+                'params': {
+                    'writer': args.writer,
+                    'reader': args.reader,
+                },
             }
-            if not match:
-                result['writer_sample'] = w_result[:5]
-                result['reader_sample'] = r_result[:5]
 
-            read_results.append(result)
+            if args.output:
+                with open(args.output, 'w') as f:
+                    json.dump(report, f, indent=2)
+                print(f'\nJSON written to {args.output}')
 
-        # --- Write rejection ---
-        print(f'\nRunning {len(WRITE_REJECTION_QUERIES)} write rejection tests on reader...')
-        rejection_results = []
-
-        for name, query in WRITE_REJECTION_QUERIES:
-            if _shutdown.is_set():
-                break
-
-            result = await _test_write_rejection(reader, name, query)
-            status = 'PASS' if result['pass'] else 'FAIL'
-            print(f'  [{status}] {name}')
-            rejection_results.append(result)
-
-        # --- Summary ---
-        read_passed = sum(1 for r in read_results if r['pass'])
-        read_total = len(read_results)
-        reject_passed = sum(1 for r in rejection_results if r['pass'])
-        reject_total = len(rejection_results)
-        all_passed = (read_passed == read_total) and (reject_passed == reject_total)
-
-        print(f'\n{"=" * 50}')
-        print(f'Read queries:      {read_passed}/{read_total} passed')
-        print(f'Write rejections:  {reject_passed}/{reject_total} passed')
-        print(f'Overall:           {"PASS" if all_passed else "FAIL"}')
-
-        # --- JSON output ---
-        report = {
-            'overall': 'PASS' if all_passed else 'FAIL',
-            'seed_time': round(seed_time, 3),
-            'read_queries': {
-                'passed': read_passed,
-                'total': read_total,
-                'results': read_results,
-            },
-            'write_rejections': {
-                'passed': reject_passed,
-                'total': reject_total,
-                'results': rejection_results,
-            },
-            'params': {
-                'writer': args.writer,
-                'reader': args.reader,
-            },
-        }
-
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(report, f, indent=2)
-            print(f'\nJSON written to {args.output}')
+        finally:
+            if reader_ctx is not None:
+                await reader_ctx.__aexit__(None, None, None)
 
     return 0 if all_passed else 1
 

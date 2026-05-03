@@ -325,11 +325,19 @@ case $TEST in
     soak)
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_soak.py $WRITER_URL --duration $DURATION --read-tps 100 --write-tps 30 $OUTPUT_FLAG";;
     correctness)
-        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_correctness.py --writer $WRITER_URL --reader $READER_URL $OUTPUT_FLAG";;
+        READER_FLAG=""
+        if [[ "$READERS" -gt 0 ]]; then
+            READER_FLAG="--reader $READER_URL"
+        fi
+        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_correctness.py --writer $WRITER_URL $READER_FLAG $OUTPUT_FLAG";;
     throughput)
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_throughput.py $WRITER_URL $OUTPUT_FLAG";;
     recovery)
-        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_recovery.py $WRITER_URL $OUTPUT_FLAG";;
+        READER_PORTS_FLAG=""
+        if [[ "$READERS" -gt 0 ]]; then
+            READER_PORTS_FLAG="--reader-ports 27493,27494"
+        fi
+        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_recovery.py $WRITER_URL $READER_PORTS_FLAG $OUTPUT_FLAG";;
     read-after-write)
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_read_after_write.py $WRITER_URL $OUTPUT_FLAG";;
 esac
