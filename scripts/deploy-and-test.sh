@@ -45,7 +45,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$TEST" ]]; then
-    echo "Usage: $0 --test <pathological|soak|correctness|throughput|recovery|read-after-write> [options]"
+    echo "Usage: $0 --test <pathological|soak|correctness|throughput|recovery|read-after-write|parallel-reads> [options]"
     echo ""
     echo "Options:"
     echo "  --branch <name>         Branch to test (default: current branch)"
@@ -59,7 +59,7 @@ fi
 
 # Validate test name
 case $TEST in
-    pathological|soak|correctness|throughput|recovery|read-after-write) ;;
+    pathological|soak|correctness|throughput|recovery|read-after-write|parallel-reads|mixed-load) ;;
     *) echo "ERROR: Unknown test '$TEST'"; exit 1;;
 esac
 
@@ -225,7 +225,8 @@ rsync -a --exclude=.git --exclude=__pycache__ --exclude=.kiro --exclude='*.pem' 
 if [[ "$BRANCH" != "phase2-multi-process" ]]; then
     mkdir -p "$STAGE/scripts"
     for f in test_pathological.py test_soak.py test_correctness.py \
-             test_throughput.py test_recovery.py test_read_after_write.py; do
+             test_throughput.py test_recovery.py test_read_after_write.py \
+             test_parallel_reads.py test_mixed_load.py; do
         git show "phase2-multi-process:scripts/$f" > "$STAGE/scripts/$f"
     done
 fi
@@ -340,6 +341,10 @@ case $TEST in
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_recovery.py $WRITER_URL $READER_PORTS_FLAG $OUTPUT_FLAG";;
     read-after-write)
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_read_after_write.py $WRITER_URL $OUTPUT_FLAG";;
+    parallel-reads)
+        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_parallel_reads.py $WRITER_URL --concurrency 64 $OUTPUT_FLAG";;
+    mixed-load)
+        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_mixed_load.py $WRITER_URL --write-pct 10 --duration $DURATION $OUTPUT_FLAG";;
 esac
 
 # Soak tests need a longer SSM timeout
