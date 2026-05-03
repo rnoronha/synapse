@@ -25,6 +25,11 @@ READONLY_REFRESH_PERIOD = 5.0
 READ_TIMEOUT = READONLY_REFRESH_PERIOD + 2.0
 BACKOFF_DELAYS = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 3.0, 5.0]
 
+# Pass/fail thresholds
+MIN_CONSISTENCY_RATE = 0.999
+MAX_P99_STALENESS = READONLY_REFRESH_PERIOD + 2.0
+MAX_PERMANENT_MISSES = 0
+
 CONDITIONS = [
     ('low',       1,  None),
     ('medium',   10,  None),
@@ -40,9 +45,12 @@ def _handle_signal():
 
 
 async def _storm_has_node(prox, query):
+    """Check if a storm query returns a node. Raises on connection/server errors."""
     async for mesg in prox.storm(query):
         if mesg[0] == 'node':
             return True
+        if mesg[0] == 'err':
+            raise RuntimeError(f'Storm error: {mesg[1]}')
     return False
 
 
@@ -148,15 +156,18 @@ async def main():
         print(f'\n=== Condition: {name} — {rate}/s for {duration}s ===')
 
         results = []
+        errors = 0
         try:
             async for found, staleness in _run_condition(args.url, name, rate, duration):
                 results.append((found, staleness))
                 if len(results) % 100 == 0:
                     print(f'  {len(results)} iterations...', end='\r')
         except Exception as exc:
-            print(f'  Error: {exc}')
+            errors += 1
+            print(f'  Error (condition aborted): {exc}')
 
         stats = _compute_stats(results)
+        stats['errors'] = errors
         all_stats[name] = stats
         all_raw[name] = results
         print(f'  Done: {stats["total"]} iterations, '
@@ -169,6 +180,25 @@ async def main():
 
     _print_table(all_stats)
 
+    # --- Pass/fail verdict ---
+    passed = True
+    for name, st in all_stats.items():
+        if st['total'] == 0:
+            print(f'FAIL: {name} — 0 results (vacuous pass)')
+            passed = False
+        if st['errors'] > 0:
+            print(f'FAIL: {name} — {st["errors"]} error(s)')
+            passed = False
+        if st['missed'] > MAX_PERMANENT_MISSES:
+            print(f'FAIL: {name} — {st["missed"]} permanent miss(es) (max {MAX_PERMANENT_MISSES})')
+            passed = False
+        if st['total'] > 0 and st['consistency_rate'] < MIN_CONSISTENCY_RATE:
+            print(f'FAIL: {name} — consistency {st["consistency_rate"]:.2%} < {MIN_CONSISTENCY_RATE:.2%}')
+            passed = False
+        if st['staleness_p99'] > MAX_P99_STALENESS:
+            print(f'FAIL: {name} — p99 staleness {st["staleness_p99"]:.3f}s > {MAX_P99_STALENESS:.1f}s')
+            passed = False
+
     output = args.output or 'raw_results.json'
     report = {
         'conditions': {
@@ -180,6 +210,12 @@ async def main():
     with open(output, 'w') as f:
         json.dump(report, f, indent=2)
     print(f'\nResults written to {output}')
+
+    if passed:
+        print('\nVERDICT: PASS')
+    else:
+        print('\nVERDICT: FAIL')
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == '__main__':

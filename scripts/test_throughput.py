@@ -47,7 +47,7 @@ async def _count_storm(prox, query):
 async def _seed_nodes(prox):
     """Seed test data, skipping forms that already have enough nodes."""
     for form, target, template in SEED_SPEC:
-        existing = await _count_storm(prox, f'{form} | count')
+        existing = await prox.count(form)
         if existing >= target:
             print(f'  {form}: {existing} exist (>= {target}), skipping')
             continue
@@ -76,15 +76,22 @@ async def _seed_nodes(prox):
 
 async def _run_sequential(prox, queries):
     t0 = time.monotonic()
+    counts = []
     for q in queries:
-        await _count_storm(prox, q)
-    return time.monotonic() - t0
+        counts.append(await _count_storm(prox, q))
+    return time.monotonic() - t0, counts
 
 
 async def _run_concurrent(prox, queries):
     t0 = time.monotonic()
-    await asyncio.gather(*[_count_storm(prox, q) for q in queries])
-    return time.monotonic() - t0
+    results = await asyncio.gather(
+        *[_count_storm(prox, q) for q in queries],
+        return_exceptions=True,
+    )
+    errors = [r for r in results if isinstance(r, BaseException)]
+    if errors:
+        raise RuntimeError(f'{len(errors)}/{len(results)} concurrent queries failed: {errors[0]}')
+    return time.monotonic() - t0, list(results)
 
 
 def _build_query_rotation(concurrency):
@@ -143,21 +150,39 @@ async def main():
         for i in range(args.warmup):
             if _shutdown.is_set():
                 break
-            await _run_sequential(prox, queries)
-            await _run_concurrent(prox, queries)
+            _ = await _run_sequential(prox, queries)
+            _ = await _run_concurrent(prox, queries)
         warmup_time = round(time.monotonic() - warmup_t0, 6)
         print(f'Warmup complete in {warmup_time:.3f}s\n')
+
+        error_count = 0
 
         for run_num in range(1, args.runs + 1):
             if _shutdown.is_set():
                 print('\nInterrupted — printing partial results.')
                 break
 
-            seq_time = await _run_sequential(prox, queries)
+            try:
+                seq_time, seq_counts = await _run_sequential(prox, queries)
+            except Exception as exc:
+                print(f'Run {run_num}: sequential FAILED: {exc}')
+                error_count += 1
+                continue
+
             if _shutdown.is_set():
                 break
 
-            con_time = await _run_concurrent(prox, queries)
+            try:
+                con_time, con_counts = await _run_concurrent(prox, queries)
+            except Exception as exc:
+                print(f'Run {run_num}: concurrent FAILED: {exc}')
+                error_count += 1
+                continue
+
+            if seq_counts != con_counts:
+                print(f'Run {run_num}: MISMATCH seq_counts={seq_counts} con_counts={con_counts}')
+                error_count += 1
+
             speedup = seq_time / con_time if con_time > 0 else 0
 
             results.append({
@@ -165,11 +190,19 @@ async def main():
                 'sequential_time': round(seq_time, 6),
                 'concurrent_time': round(con_time, 6),
                 'speedup': round(speedup, 4),
+                'seq_counts': seq_counts,
+                'con_counts': con_counts,
             })
 
     if not results:
         print('No results collected.')
         return 1
+
+    # Vacuous pass detection: if all counts are 0, queries returned nothing
+    all_counts = [c for r in results for c in r['seq_counts']]
+    if all(c == 0 for c in all_counts):
+        print('\nSUSPICIOUS: all queries returned 0 results — vacuous pass.')
+        error_count += 1
 
     _print_table(results)
     _print_averages(results)
@@ -185,12 +218,15 @@ async def main():
             },
             'warmup_time': warmup_time,
             'results': results,
+            'error_count': error_count,
         }
         with open(args.output, 'w') as f:
             json.dump(report, f, indent=2)
         print(f'\nJSON written to {args.output}')
 
-    return 0
+    passed = error_count == 0
+    print(f'\n{"PASS" if passed else "FAIL"} (errors: {error_count})')
+    return 0 if passed else 1
 
 
 if __name__ == '__main__':

@@ -53,15 +53,20 @@ def _percentile(sorted_data, pct):
 
 async def _count_storm(prox, query):
     count = 0
+    errors = 0
     async for mesg in prox.storm(query):
         if mesg[0] == 'node':
             count += 1
-    return count
+        elif mesg[0] == 'err':
+            errors += 1
+    return count, errors
 
 
 async def _seed_nodes(prox):
+    total_errors = 0
     for form, target, template in SEED_SPEC:
-        existing = await _count_storm(prox, f'{form} | count')
+        existing, errs = await _count_storm(prox, f'{form} | limit {target}')
+        total_errors += errs
         if existing >= target:
             print(f'  {form}: {existing} exist (>= {target}), skipping')
             continue
@@ -81,24 +86,30 @@ async def _seed_nodes(prox):
 
         for start in range(0, len(batch), 50):
             chunk = ' '.join(batch[start:start + 50])
-            async for _ in prox.storm(chunk):
-                pass
+            async for mesg in prox.storm(chunk):
+                if mesg[0] == 'err':
+                    total_errors += 1
 
         print('done')
+    return total_errors
 
 
 async def _timed_query(prox, query):
     t0 = time.monotonic()
-    await _count_storm(prox, query)
-    return time.monotonic() - t0
+    count, errors = await _count_storm(prox, query)
+    elapsed = time.monotonic() - t0
+    return elapsed, count, errors
 
 
 async def _run_iteration(prox, concurrency):
     queries = [random.choice(QUERIES) for _ in range(concurrency)]
     t0 = time.monotonic()
-    latencies = await asyncio.gather(*[_timed_query(prox, q) for q in queries])
+    results = await asyncio.gather(*[_timed_query(prox, q) for q in queries])
     wall = time.monotonic() - t0
-    return wall, list(latencies)
+    latencies = [r[0] for r in results]
+    total_results = sum(r[1] for r in results)
+    total_errors = sum(r[2] for r in results)
+    return wall, latencies, total_results, total_errors
 
 
 def _print_table(rows):
@@ -152,6 +163,8 @@ async def main():
 
     results = []
     raw_latencies = {}
+    total_errors = 0
+    total_results = 0
 
     async with await s_telepath.openurl(args.url) as prox:
         print(f'Connected to {args.url}')
@@ -160,7 +173,10 @@ async def main():
         print(f'Query rotation: {len(QUERIES)} queries\n')
 
         print('Seeding data (1000 nodes):')
-        await _seed_nodes(prox)
+        seed_errors = await _seed_nodes(prox)
+        total_errors += seed_errors
+        if seed_errors:
+            print(f'  WARNING: {seed_errors} errors during seeding')
 
         print(f'\nWarmup: {args.warmup} iterations (not measured)...')
         for i in range(args.warmup):
@@ -174,7 +190,9 @@ async def main():
                 print('\nInterrupted — printing partial results.')
                 break
 
-            wall, latencies = await _run_iteration(prox, args.concurrency)
+            wall, latencies, iter_results, iter_errors = await _run_iteration(prox, args.concurrency)
+            total_errors += iter_errors
+            total_results += iter_results
             stats = _compute_stats(wall, latencies, it, args.concurrency)
             results.append(stats)
             raw_latencies[it] = [round(l, 6) for l in latencies]
@@ -185,6 +203,20 @@ async def main():
 
     _print_table(results)
     _print_averages(results)
+
+    # Failure detection
+    passed = True
+
+    if total_errors > 0:
+        print(f'\nFAIL: {total_errors} query errors detected')
+        passed = False
+
+    if total_results == 0:
+        print(f'\nFAIL: 0 total results across all queries (vacuous pass)')
+        passed = False
+
+    if passed:
+        print('\nPASS')
 
     if args.output:
         report = {
@@ -202,7 +234,7 @@ async def main():
             json.dump(report, f, indent=2)
         print(f'\nJSON written to {args.output}')
 
-    return 0
+    return 0 if passed else 1
 
 
 if __name__ == '__main__':
