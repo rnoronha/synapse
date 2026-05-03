@@ -295,6 +295,22 @@ for i in $(seq 1 24); do
     sleep 5
 done
 
+# Telepath readiness probe: port LISTEN != accepting connections
+echo "Verifying telepath connectivity (max 60s)..."
+run_ssm "for i in \$(seq 1 30); do python3.11 -c \"
+import asyncio, sys
+async def check():
+    try:
+        import synapse.telepath as t
+        async with await t.openurl('tcp://127.0.0.1:27492/cortex') as prox:
+            await prox.getCellInfo()
+            print('READY')
+    except Exception as e:
+        print(f'WAITING: {e}')
+        sys.exit(1)
+asyncio.run(check())
+\" && break || sleep 2; done"
+
 # ── PHASE 5: RUN TEST ─────────────────────────────────────────────────
 echo ""
 echo "── PHASE 5: RUN TEST ($TEST) ──────────────────────────────"
