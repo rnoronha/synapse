@@ -188,7 +188,9 @@ async def main():
             count = 0
             async for mesg in prox.storm('inet:fqdn | count'):
                 if mesg[0] == 'print':
-                    count = int(mesg[1]['mesg'])
+                    m = re.search(r'(\d+)', mesg[1]['mesg'])
+                    if m:
+                        count = int(m.group(1))
         if count < 100:
             raise RuntimeError(f'Expected 100 nodes, got {count}')
         return f'{count} inet:fqdn nodes seeded and verified'
