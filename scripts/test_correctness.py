@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -29,6 +30,9 @@ def _handle_signal():
 # -----------------------------------------------------------------------
 # Seed data
 # -----------------------------------------------------------------------
+
+SENTINEL_FQDN = 'sentinel.correctness.test.com'
+
 
 def _build_seed_queries():
     """Return storm queries that create the full test dataset."""
@@ -53,6 +57,9 @@ def _build_seed_queries():
     # A dns:a record for pivot tests
     queries.append('[ inet:dns:a=(host1.test.com, 10.0.0.1) ]')
 
+    # Sentinel node — written last, used to verify replication completeness
+    queries.append(f'[ inet:fqdn={SENTINEL_FQDN} ]')
+
     return queries
 
 
@@ -65,17 +72,34 @@ async def _seed(prox):
             pass
 
 
+async def _wait_for_replication(reader, timeout=30):
+    """Poll reader for sentinel node instead of sleeping a fixed duration."""
+    query = f'inet:fqdn={SENTINEL_FQDN}'
+    deadline = time.monotonic() + timeout
+    interval = 0.5
+    while time.monotonic() < deadline:
+        nodes = await _collect_nodes(reader, query)
+        if len(nodes) == 1:
+            return True
+        await asyncio.sleep(interval)
+        interval = min(interval * 1.5, 3.0)
+    return False
+
+
 # -----------------------------------------------------------------------
 # Query helpers
 # -----------------------------------------------------------------------
 
 async def _collect_nodes(prox, query):
-    """Run a storm query and return sorted list of node primary values."""
+    """Run a storm query and return sorted list of (ndef, props, tags) tuples."""
     nodes = []
     async for mesg in prox.storm(query):
         if mesg[0] == 'node':
-            nodes.append(mesg[1][0])
-    nodes.sort(key=str)
+            ndef = mesg[1][0]
+            props = mesg[1][1].get('props', {})
+            tags = sorted(mesg[1][1].get('tags', {}).keys())
+            nodes.append((ndef, props, tags))
+    nodes.sort(key=lambda n: str(n[0]))
     return nodes
 
 
@@ -92,52 +116,53 @@ async def _collect_print(prox, query):
 # Read queries (26 total)
 # -----------------------------------------------------------------------
 
+# (name, mode, query, min_expected) — min_expected prevents vacuous [] == [] passes
 READ_QUERIES = [
     # Exact lifts (3)
-    ('exact_fqdn',          'node', 'inet:fqdn=host1.test.com'),
-    ('exact_ipv4',          'node', 'inet:ipv4=10.0.0.1'),
-    ('exact_url',           'node', 'inet:url="http://host0.test.com/page0"'),
+    ('exact_fqdn',          'node', 'inet:fqdn=host1.test.com', 1),
+    ('exact_ipv4',          'node', 'inet:ipv4=10.0.0.1', 1),
+    ('exact_url',           'node', 'inet:url="http://host0.test.com/page0"', 1),
 
     # Broad lifts with limits (3)
-    ('broad_fqdn',          'node', 'inet:fqdn | limit 50'),
-    ('broad_ipv4',          'node', 'inet:ipv4 | limit 20'),
-    ('broad_url',           'node', 'inet:url | limit 10'),
+    ('broad_fqdn',          'node', 'inet:fqdn | limit 50', 50),
+    ('broad_ipv4',          'node', 'inet:ipv4 | limit 20', 20),
+    ('broad_url',           'node', 'inet:url | limit 10', 10),
 
-    # Zone filter (2)
-    ('zone_com',            'node', 'inet:fqdn:zone=com'),
-    ('zone_test_com',       'node', 'inet:fqdn:zone=test.com'),
+    # Zone filter (2) — host*.test.com has zone=test.com, not zone=com
+    ('zone_test_com',       'node', 'inet:fqdn:zone=test.com', 50),
+    ('zone_com',            'node', 'inet:fqdn:zone=com', 0),
 
     # Tag lifts (3)
-    ('tag_test',            'node', '#test'),
-    ('tag_test_tag0',       'node', '#test.tag0'),
-    ('fqdn_with_tag',       'node', 'inet:fqdn#test'),
+    ('tag_test',            'node', '#test', 10),
+    ('tag_test_tag0',       'node', '#test.tag0', 1),
+    ('fqdn_with_tag',       'node', 'inet:fqdn#test', 10),
 
-    # Prefix (2)
-    ('prefix_host',         'node', 'inet:fqdn:fqdn~=host'),
-    ('prefix_host1',        'node', 'inet:fqdn:fqdn~="host1"'),
+    # Prefix (2) — fixed: was inet:fqdn:fqdn~= which is not a valid property
+    ('prefix_host',         'node', 'inet:fqdn~="host"', 50),
+    ('prefix_host1',        'node', 'inet:fqdn~="host1"', 11),
 
     # Count (3)
-    ('count_fqdn',          'print', 'inet:fqdn | count'),
-    ('count_ipv4',          'print', 'inet:ipv4 | count'),
-    ('count_url',           'print', 'inet:url | count'),
+    ('count_fqdn',          'print', 'inet:fqdn | count', 1),
+    ('count_ipv4',          'print', 'inet:ipv4 | count', 1),
+    ('count_url',           'print', 'inet:url | count', 1),
 
     # Pivot (2)
-    ('pivot_dns_a',         'node', 'inet:fqdn=host1.test.com -> inet:dns:a'),
-    ('pivot_ipv4',          'node', 'inet:dns:a:fqdn=host1.test.com -> inet:ipv4'),
+    ('pivot_dns_a',         'node', 'inet:fqdn=host1.test.com -> inet:dns:a', 1),
+    ('pivot_ipv4',          'node', 'inet:dns:a:fqdn=host1.test.com -> inet:ipv4', 1),
 
     # Filter (2)
-    ('filter_zone_com',     'node', 'inet:fqdn +inet:fqdn:zone=com'),
-    ('filter_zone_test',    'node', 'inet:fqdn +inet:fqdn:zone=test.com'),
+    ('filter_zone_com',     'node', 'inet:fqdn +inet:fqdn:zone=com', 0),
+    ('filter_zone_test',    'node', 'inet:fqdn +inet:fqdn:zone=test.com', 50),
 
     # Subquery filter (2)
-    ('subq_has_dns',        'node', 'inet:fqdn +{ -> inet:dns:a }'),
-    ('subq_no_dns',         'node', 'inet:fqdn -{ -> inet:dns:a } | limit 10'),
+    ('subq_has_dns',        'node', 'inet:fqdn +{ -> inet:dns:a }', 1),
+    ('subq_no_dns',         'node', 'inet:fqdn -{ -> inet:dns:a } | limit 10', 10),
 
     # Expressions and variables (4)
-    ('var_assign',          'print', '$x = 42 $lib.print($x)'),
-    ('var_len',             'print', '$vals = (1, 2, 3) $lib.print($lib.len($vals))'),
-    ('lib_guid',            'print', '$lib.print($lib.guid())'),
-    ('expr_math',           'print', '$x = $( 6 * 7 ) $lib.print($x)'),
+    ('var_assign',          'print', '$x = 42 $lib.print($x)', 1),
+    ('var_len',             'print', '$vals = (1, 2, 3) $lib.print($lib.len($vals))', 1),
+    ('lib_guid',            'print', '$lib.print($lib.guid())', 1),
+    ('expr_math',           'print', '$x = $( 6 * 7 ) $lib.print($x)', 1),
 ]
 
 assert len(READ_QUERIES) == 26, f'Expected 26 read queries, got {len(READ_QUERIES)}'
@@ -175,8 +200,12 @@ async def _test_write_rejection(prox, name, query):
 
 
 # -----------------------------------------------------------------------
-# Main
+# Comparison helpers
 # -----------------------------------------------------------------------
+
+_GUID_RE = re.compile(r'^[0-9a-f]{32}$')
+_COUNT_RE = re.compile(r'\d+')
+
 
 async def _run_read_query(prox, mode, query):
     if mode == 'node':
@@ -185,13 +214,42 @@ async def _run_read_query(prox, mode, query):
 
 
 def _compare(writer_result, reader_result, mode, name):
-    """Compare results. For guid/nondeterministic outputs, check shape only."""
+    """Compare results with validation for nondeterministic and print outputs."""
     if name == 'lib_guid':
-        # GUIDs differ per call — just verify both returned one
-        return len(writer_result) == 1 and len(reader_result) == 1
+        # GUIDs differ per call — verify both returned a valid GUID
+        return (len(writer_result) == 1 and _GUID_RE.match(writer_result[0])
+                and len(reader_result) == 1 and _GUID_RE.match(reader_result[0]))
+
+    # For count queries, validate the print message actually contains a number
+    if name.startswith('count_'):
+        for result in (writer_result, reader_result):
+            if not result or not _COUNT_RE.search(result[0]):
+                return False
+
+    if mode == 'node':
+        # Compare ndefs only for equality (props/tags checked separately)
+        w_ndefs = [n[0] for n in writer_result]
+        r_ndefs = [n[0] for n in reader_result]
+        return w_ndefs == r_ndefs
 
     return writer_result == reader_result
 
+
+def _compare_props_tags(writer_result, reader_result):
+    """Return list of mismatches in properties or tags between writer and reader nodes."""
+    mismatches = []
+    for w_node, r_node in zip(writer_result, reader_result):
+        ndef = w_node[0]
+        if w_node[1] != r_node[1]:
+            mismatches.append(f'{ndef}: props differ')
+        if w_node[2] != r_node[2]:
+            mismatches.append(f'{ndef}: tags differ')
+    return mismatches
+
+
+# -----------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------
 
 async def main():
     parser = argparse.ArgumentParser(
@@ -209,6 +267,12 @@ async def main():
         loop.add_signal_handler(sig, _handle_signal)
 
     single_mode = args.reader is None
+    all_passed = False
+    error_count = 0
+    suspicious = []
+    seed_time = 0.0
+    read_results = []
+    rejection_results = []
 
     if single_mode:
         print('Single-process mode: recording baseline query results (no reader comparison)')
@@ -230,46 +294,100 @@ async def main():
             print(f'  Seeded in {seed_time:.2f}s')
 
             if not single_mode:
-                await asyncio.sleep(6)
+                print('Waiting for replication (sentinel node)...', flush=True)
+                synced = await _wait_for_replication(reader)
+                if not synced:
+                    print('  WARNING: sentinel node not found on reader after timeout')
+                    error_count += 1
+                else:
+                    print('  Replication confirmed')
 
             # --- Read queries ---
             if single_mode:
                 print(f'\nRunning {len(READ_QUERIES)} read queries against writer...')
             else:
                 print(f'\nRunning {len(READ_QUERIES)} read queries against both endpoints...')
-            read_results = []
 
-            for name, mode, query in READ_QUERIES:
+            for name, mode, query, min_expected in READ_QUERIES:
                 if _shutdown.is_set():
                     break
 
-                w_result = await _run_read_query(writer, mode, query)
+                try:
+                    w_result = await _run_read_query(writer, mode, query)
+                except Exception as exc:
+                    print(f'  [FAIL] {name} — writer exception: {exc}')
+                    error_count += 1
+                    read_results.append({
+                        'name': name, 'query': query, 'pass': False,
+                        'error': f'writer exception: {exc}',
+                    })
+                    continue
+
+                # Vacuous pass detection
+                w_count = len(w_result)
+                is_suspicious = (w_count == 0 and min_expected > 0)
+                if is_suspicious:
+                    suspicious.append(name)
 
                 if single_mode:
-                    print(f'  [RECORDED] {name}')
+                    status = 'SUSPICIOUS' if is_suspicious else 'RECORDED'
+                    print(f'  [{status}] {name} (count={w_count}, min_expected={min_expected})')
                     read_results.append({
-                        'name': name,
-                        'query': query,
-                        'pass': True,
-                        'writer_count': len(w_result),
+                        'name': name, 'query': query,
+                        'pass': not is_suspicious,
+                        'suspicious': is_suspicious,
+                        'writer_count': w_count,
                         'reader_count': None,
+                        'min_expected': min_expected,
                     })
-                else:
+                    continue
+
+                try:
                     r_result = await _run_read_query(reader, mode, query)
-                    match = _compare(w_result, r_result, mode, name)
-                    status = 'PASS' if match else 'FAIL'
-                    print(f'  [{status}] {name}')
-                    result = {
-                        'name': name,
-                        'query': query,
-                        'pass': match,
-                        'writer_count': len(w_result),
-                        'reader_count': len(r_result),
-                    }
-                    if not match:
-                        result['writer_sample'] = w_result[:5]
-                        result['reader_sample'] = r_result[:5]
-                    read_results.append(result)
+                except Exception as exc:
+                    print(f'  [FAIL] {name} — reader exception: {exc}')
+                    error_count += 1
+                    read_results.append({
+                        'name': name, 'query': query, 'pass': False,
+                        'error': f'reader exception: {exc}',
+                    })
+                    continue
+
+                r_count = len(r_result)
+                match = _compare(w_result, r_result, mode, name)
+
+                # Check writer meets minimum expected count
+                if w_count < min_expected:
+                    match = False
+
+                # Check property/tag equivalence for node queries
+                prop_tag_mismatches = []
+                if mode == 'node' and match:
+                    prop_tag_mismatches = _compare_props_tags(w_result, r_result)
+                    if prop_tag_mismatches:
+                        match = False
+
+                is_suspicious = (w_count == 0 and r_count == 0 and min_expected > 0)
+                if is_suspicious:
+                    suspicious.append(name)
+
+                status = 'SUSPICIOUS' if is_suspicious else ('PASS' if match else 'FAIL')
+                print(f'  [{status}] {name} (w={w_count}, r={r_count}, min={min_expected})')
+
+                result = {
+                    'name': name, 'query': query,
+                    'pass': match and not is_suspicious,
+                    'suspicious': is_suspicious,
+                    'writer_count': w_count,
+                    'reader_count': r_count,
+                    'min_expected': min_expected,
+                }
+                if not match:
+                    result['writer_sample'] = [n[0] for n in w_result[:5]] if mode == 'node' else w_result[:5]
+                    result['reader_sample'] = [n[0] for n in r_result[:5]] if mode == 'node' else r_result[:5]
+                if prop_tag_mismatches:
+                    result['prop_tag_mismatches'] = prop_tag_mismatches[:10]
+                read_results.append(result)
 
             # --- Write rejection ---
             rejection_results = []
@@ -290,7 +408,12 @@ async def main():
             read_total = len(read_results)
             reject_passed = sum(1 for r in rejection_results if r['pass'])
             reject_total = len(rejection_results)
-            all_passed = (read_passed == read_total) and (reject_passed == reject_total)
+            all_passed = (
+                read_passed == read_total
+                and reject_passed == reject_total
+                and error_count == 0
+                and len(suspicious) == 0
+            )
 
             print(f'\n{"=" * 50}')
             print(f'Read queries:      {read_passed}/{read_total} passed')
@@ -298,6 +421,10 @@ async def main():
                 print(f'Write rejections:  skipped (single-process mode)')
             else:
                 print(f'Write rejections:  {reject_passed}/{reject_total} passed')
+            if error_count:
+                print(f'Errors:            {error_count}')
+            if suspicious:
+                print(f'Suspicious (0 results, expected >0): {suspicious}')
             print(f'Overall:           {"PASS" if all_passed else "FAIL"}')
 
             # --- JSON output ---
@@ -305,6 +432,8 @@ async def main():
                 'overall': 'PASS' if all_passed else 'FAIL',
                 'seed_time': round(seed_time, 3),
                 'single_mode': single_mode,
+                'error_count': error_count,
+                'suspicious': suspicious,
                 'read_queries': {
                     'passed': read_passed,
                     'total': read_total,
@@ -330,8 +459,8 @@ async def main():
             if reader_ctx is not None:
                 await reader_ctx.__aexit__(None, None, None)
 
-    return 0 if all_passed else 1
+    sys.exit(0 if all_passed else 1)
 
 
 if __name__ == '__main__':
-    sys.exit(asyncio.run(main()))
+    asyncio.run(main())
