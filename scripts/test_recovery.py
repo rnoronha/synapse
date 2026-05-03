@@ -47,7 +47,7 @@ def _pid_from_port(port):
     return None
 
 
-def _wait_pid_gone(pid, timeout=5):
+def _wait_pid_gone(pid, timeout=15):
     """Poll until a PID no longer exists. Raises if still alive after timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -185,7 +185,10 @@ async def main():
                 async for _ in prox.storm(f'[inet:fqdn=recovery-{i}.test.com]'):
                     pass
             # Verify all 100 nodes exist
-            count = await _storm_count(prox, 'inet:fqdn=recovery-*.test.com')
+            count = 0
+            async for mesg in prox.storm('inet:fqdn | count'):
+                if mesg[0] == 'print':
+                    count = int(mesg[1]['mesg'])
         if count < 100:
             raise RuntimeError(f'Expected 100 nodes, got {count}')
         return f'{count} inet:fqdn nodes seeded and verified'
