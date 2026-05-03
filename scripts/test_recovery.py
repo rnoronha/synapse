@@ -21,6 +21,9 @@ import synapse.telepath as s_telepath
 
 _shutdown = asyncio.Event()
 
+# Minimum success ratio for failover read tests (steps 4 & 8)
+_FAILOVER_MIN_SUCCESSES = 8
+
 
 def _handle_signal():
     _shutdown.set()
@@ -44,6 +47,18 @@ def _pid_from_port(port):
     return None
 
 
+def _wait_pid_gone(pid, timeout=5):
+    """Poll until a PID no longer exists. Raises if still alive after timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)  # signal 0 = existence check
+        except ProcessLookupError:
+            return
+        time.sleep(0.2)
+    raise RuntimeError(f'PID {pid} still alive after {timeout}s')
+
+
 async def _get_cell_info(url, timeout=5):
     """Connect to a telepath URL and return getCellInfo() result."""
     async with await s_telepath.openurl(url) as prox:
@@ -63,6 +78,7 @@ class Step:
     def __init__(self, name):
         self.name = name
         self.passed = False
+        self.suspicious = False
         self.detail = ''
         self.elapsed = 0.0
 
@@ -70,6 +86,7 @@ class Step:
         return {
             'name': self.name,
             'passed': self.passed,
+            'suspicious': self.suspicious,
             'detail': self.detail,
             'elapsed_s': round(self.elapsed, 3),
         }
@@ -83,10 +100,11 @@ async def run_step(name, func):
         step.detail = await func()
         step.passed = True
     except Exception as exc:
-        step.detail = str(exc)
+        step.detail = f'EXCEPTION: {type(exc).__name__}: {exc}'
     step.elapsed = time.monotonic() - t0
     status = 'PASS' if step.passed else 'FAIL'
-    print(f'  [{status}] {name} ({step.elapsed:.1f}s) — {step.detail}')
+    suffix = ' [SUSPICIOUS: vacuous result]' if step.suspicious else ''
+    print(f'  [{status}] {name} ({step.elapsed:.1f}s) — {step.detail}{suffix}')
     return step
 
 
@@ -106,7 +124,7 @@ async def main():
     reader_ports = [int(p.strip()) for p in args.reader_ports.split(',') if p.strip()]
 
     if not reader_ports:
-        print('Single-process mode: no readers configured — recovery test N/A')
+        print('WARNING: Single-process mode — recovery test SKIPPED (no readers configured)')
         step_names = [
             '1. Health check', '2. Seed 100 nodes', '3. Kill reader 1',
             '4. Reads after kill (failover)', '5. Poll reader 1 respawn',
@@ -117,8 +135,13 @@ async def main():
         report = {
             'url': args.url,
             'reader_ports': [],
-            'steps': [{'name': n, 'passed': True, 'detail': 'N/A', 'elapsed_s': 0.0} for n in step_names],
-            'passed': len(step_names),
+            'skipped': True,
+            'steps': [{'name': n, 'passed': False, 'suspicious': False,
+                        'detail': 'SKIPPED — no readers configured', 'elapsed_s': 0.0}
+                       for n in step_names],
+            'passed': 0,
+            'failed': 0,
+            'skipped_count': len(step_names),
             'total': len(step_names),
             'total_time_s': 0.0,
         }
@@ -126,7 +149,9 @@ async def main():
             with open(args.output, 'w') as f:
                 json.dump(report, f, indent=2)
             print(f'Results written to {args.output}')
-        return 0
+        print('Result: SKIP (no assertions executed)')
+        return 2  # distinct from pass(0) and fail(1)
+
     reader_urls = [f'tcp://127.0.0.1:{p}/cortex' for p in reader_ports]
 
     print(f'Router: {args.url}')
@@ -134,6 +159,7 @@ async def main():
     print()
 
     steps = []
+    errors = 0
 
     # --- Step 1: Health check all readers ---
     async def health_check():
@@ -141,14 +167,16 @@ async def main():
         for port, url in zip(reader_ports, reader_urls):
             info = await _get_cell_info(url)
             cell = info['cell']
+            if not cell.get('active'):
+                raise RuntimeError(f'Reader on port {port} is not active')
             pid = _pid_from_port(port)
             infos[port] = {'run': cell['run'], 'pid': pid, 'active': cell['active']}
             print(f'    port={port} pid={pid} run={cell["run"][:8]} active={cell["active"]}')
-        return f'{len(infos)} readers healthy'
+        return f'{len(infos)} readers healthy (all active)'
 
     steps.append(await run_step('1. Health check', health_check))
     if _shutdown.is_set():
-        return
+        return 1
 
     # --- Step 2: Seed 100 nodes through router ---
     async def seed_nodes():
@@ -156,11 +184,15 @@ async def main():
             for i in range(100):
                 async for _ in prox.storm(f'[inet:fqdn=recovery-{i}.test.com]'):
                     pass
-        return '100 inet:fqdn nodes seeded'
+            # Verify all 100 nodes exist
+            count = await _storm_count(prox, 'inet:fqdn=recovery-*.test.com')
+        if count < 100:
+            raise RuntimeError(f'Expected 100 nodes, got {count}')
+        return f'{count} inet:fqdn nodes seeded and verified'
 
     steps.append(await run_step('2. Seed 100 nodes', seed_nodes))
     if _shutdown.is_set():
-        return
+        return 1
 
     # --- Step 3: Kill reader 1 ---
     killed_port = reader_ports[0]
@@ -171,12 +203,12 @@ async def main():
         if pid is None:
             raise RuntimeError(f'Cannot find PID for port {killed_port}')
         os.kill(pid, signal.SIGKILL)
-        await asyncio.sleep(0.5)
-        return f'Killed PID {pid} on port {killed_port}'
+        _wait_pid_gone(pid)
+        return f'Killed PID {pid} on port {killed_port} (confirmed dead)'
 
     steps.append(await run_step('3. Kill reader 1', kill_reader_1))
     if _shutdown.is_set():
-        return
+        return 1
 
     # --- Step 4: 10 reads through router (failover) ---
     async def reads_after_kill():
@@ -184,17 +216,20 @@ async def main():
         async with await s_telepath.openurl(args.url) as prox:
             for i in range(10):
                 try:
-                    await _storm_count(prox, 'inet:fqdn | limit 5')
-                    successes += 1
+                    cnt = await _storm_count(prox, 'inet:fqdn | limit 5')
+                    if cnt > 0:
+                        successes += 1
+                    # cnt == 0 doesn't count as success
                 except Exception:
                     pass
-        if successes == 0:
-            raise RuntimeError('All 10 reads failed')
+        if successes < _FAILOVER_MIN_SUCCESSES:
+            raise RuntimeError(
+                f'Only {successes}/10 reads succeeded (minimum: {_FAILOVER_MIN_SUCCESSES})')
         return f'{successes}/10 reads succeeded'
 
     steps.append(await run_step('4. Reads after kill (failover)', reads_after_kill))
     if _shutdown.is_set():
-        return
+        return 1
 
     # --- Step 5: Poll reader 1 for respawn ---
     async def poll_respawn():
@@ -211,17 +246,24 @@ async def main():
 
     steps.append(await run_step('5. Poll reader 1 respawn', poll_respawn))
     if _shutdown.is_set():
-        return
+        return 1
 
-    # --- Step 6: Verify respawned reader serves query ---
+    # --- Step 6: Verify respawned reader serves correct data ---
     async def verify_respawned():
         async with await s_telepath.openurl(killed_url) as prox:
             count = await _storm_count(prox, 'inet:fqdn | limit 10')
-        return f'Respawned reader returned {count} nodes'
+            if count == 0:
+                raise RuntimeError('Respawned reader returned 0 nodes — possible data loss')
+            # Verify a specific seeded node exists (data correctness)
+            specific = await _storm_count(prox, 'inet:fqdn=recovery-0.test.com')
+            if specific == 0:
+                raise RuntimeError(
+                    'Respawned reader missing seeded node recovery-0.test.com — data corruption')
+        return f'Respawned reader returned {count} nodes, specific node verified'
 
     steps.append(await run_step('6. Verify respawned reader', verify_respawned))
     if _shutdown.is_set():
-        return
+        return 1
 
     # --- Step 7: Kill ALL readers ---
     async def kill_all_readers():
@@ -230,15 +272,15 @@ async def main():
             pid = _pid_from_port(port)
             if pid is not None:
                 os.kill(pid, signal.SIGKILL)
+                _wait_pid_gone(pid)
                 killed.append(f'{port}(pid={pid})')
-        await asyncio.sleep(0.5)
         if not killed:
             raise RuntimeError('No reader PIDs found')
-        return f'Killed: {", ".join(killed)}'
+        return f'Killed (confirmed dead): {", ".join(killed)}'
 
     steps.append(await run_step('7. Kill ALL readers', kill_all_readers))
     if _shutdown.is_set():
-        return
+        return 1
 
     # --- Step 8: 10 reads through router (writer fallback) ---
     async def reads_writer_fallback():
@@ -246,17 +288,19 @@ async def main():
         async with await s_telepath.openurl(args.url) as prox:
             for i in range(10):
                 try:
-                    await _storm_count(prox, 'inet:fqdn | limit 5')
-                    successes += 1
+                    cnt = await _storm_count(prox, 'inet:fqdn | limit 5')
+                    if cnt > 0:
+                        successes += 1
                 except Exception:
                     pass
-        if successes == 0:
-            raise RuntimeError('All 10 reads failed — writer fallback broken')
+        if successes < _FAILOVER_MIN_SUCCESSES:
+            raise RuntimeError(
+                f'Only {successes}/10 reads succeeded (minimum: {_FAILOVER_MIN_SUCCESSES})')
         return f'{successes}/10 reads succeeded (writer fallback)'
 
     steps.append(await run_step('8. Reads (writer fallback)', reads_writer_fallback))
     if _shutdown.is_set():
-        return
+        return 1
 
     # --- Step 9: Poll all readers for respawn ---
     async def poll_all_respawn():
@@ -282,21 +326,25 @@ async def main():
 
     steps.append(await run_step('9. Poll all readers respawn', poll_all_respawn))
     if _shutdown.is_set():
-        return
+        return 1
 
     # --- Step 10: Final health check ---
     async def final_health():
         for port, url in zip(reader_ports, reader_urls):
             info = await _get_cell_info(url)
             cell = info['cell']
+            if not cell.get('active'):
+                raise RuntimeError(f'Reader on port {port} is not active after recovery')
             pid = _pid_from_port(port)
             print(f'    port={port} pid={pid} run={cell["run"][:8]} active={cell["active"]}')
-        return f'{len(reader_ports)} readers healthy'
+        return f'{len(reader_ports)} readers healthy (all active)'
 
     steps.append(await run_step('10. Final health check', final_health))
 
     # --- Summary ---
     passed = sum(1 for s in steps if s.passed)
+    failed = sum(1 for s in steps if not s.passed)
+    suspicious = sum(1 for s in steps if s.suspicious)
     total = len(steps)
     total_time = sum(s.elapsed for s in steps)
 
@@ -304,16 +352,24 @@ async def main():
     print('-' * 56)
     for s in steps:
         status = 'PASS' if s.passed else 'FAIL'
-        print(f'{s.name:<40} {status:>6} {s.elapsed:>7.1f}s')
+        flag = ' ⚠' if s.suspicious else ''
+        print(f'{s.name:<40} {status:>6} {s.elapsed:>7.1f}s{flag}')
     print('-' * 56)
     print(f'{"Total":<40} {passed}/{total:>4} {total_time:>7.1f}s')
+    if suspicious:
+        print(f'  ⚠ {suspicious} step(s) flagged SUSPICIOUS (vacuous results)')
+
+    all_pass = passed == total
 
     if args.output:
         report = {
             'url': args.url,
             'reader_ports': reader_ports,
+            'skipped': False,
             'steps': [s.as_dict() for s in steps],
             'passed': passed,
+            'failed': failed,
+            'suspicious': suspicious,
             'total': total,
             'total_time_s': round(total_time, 3),
         }
@@ -321,7 +377,7 @@ async def main():
             json.dump(report, f, indent=2)
         print(f'\nResults written to {args.output}')
 
-    return 0 if passed == total else 1
+    return 0 if all_pass else 1
 
 
 if __name__ == '__main__':
