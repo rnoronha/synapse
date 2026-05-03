@@ -370,7 +370,7 @@ async def main():
             # Precondition: verify seeded nodes with .seen exist
             seed_count = await _count_storm(prox, 'inet:fqdn +.seen', timeout=timeout)
             _assert(seed_count > 0, f'VACUOUS: 0 inet:fqdn nodes with .seen — seed failed')
-            q = 'inet:fqdn:seen@=("2023-06-01","2023-06-02")'
+            q = 'inet:fqdn.seen@=("2023-06-01","2023-06-02")'
             count = await _count_storm(prox, q, timeout=timeout)
             # 0 results is valid if seed data exists — the interval scan still ran
             return f'Interval scan returned {count} nodes ({seed_count} seeded with .seen)'
