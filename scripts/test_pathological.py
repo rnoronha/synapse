@@ -91,11 +91,11 @@ def _assert_count(count, *, min_expected=1, label='results', allow_zero=False):
 # seed data
 # ---------------------------------------------------------------
 
-SEED_FQDN = 1000
-SEED_FQDN_IVAL = 500
-SEED_GEO = 200
+SEED_FQDN = 100_000
+SEED_FQDN_IVAL = 100_000
+SEED_GEO = 100_000
 SEED_URL = 50
-SEED_IPV4 = 500
+SEED_IPV4 = 10_000
 
 async def _seed_if_empty(prox, timeout):
     """Seed pathological test data if the Cortex has fewer than 100 inet:fqdn nodes."""
