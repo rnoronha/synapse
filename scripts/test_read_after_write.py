@@ -72,14 +72,23 @@ async def _write_and_read(prox, fqdn):
     return False, time.monotonic() - t0
 
 
-async def _run_condition(url, name, rate, duration):
+async def _run_condition(url, name, rate, duration, warmup=0):
     """Run one condition, yield (found, staleness) per iteration."""
     interval = 1.0 / rate
-    deadline = time.monotonic() + duration
     i = 0
     ts = int(time.time())
 
     async with await s_telepath.openurl(url) as prox:
+        if warmup > 0:
+            print(f'\nWarmup: {warmup} iterations (not measured)...')
+            for wi in range(warmup):
+                if _shutdown.is_set():
+                    break
+                fqdn = f'raw-warmup-{ts}-{wi}.test.com'
+                await _write_and_read(prox, fqdn)
+            print('Warmup complete.\n')
+
+        deadline = time.monotonic() + duration
         while time.monotonic() < deadline and not _shutdown.is_set():
             fqdn = f'raw-{name}-{ts}-{i}.test.com'
             iter_start = time.monotonic()
@@ -153,26 +162,17 @@ async def main():
     all_stats = {}
     all_raw = {}
 
-    # Warmup: throwaway read+write ops to warm the LMDB page cache
-    if args.warmup > 0:
-        print(f'\nWarmup: {args.warmup} iterations (not measured)...')
-        ts = int(time.time())
-        async with await s_telepath.openurl(args.url) as prox:
-            for i in range(args.warmup):
-                if _shutdown.is_set():
-                    break
-                fqdn = f'raw-warmup-{ts}-{i}.test.com'
-                await _write_and_read(prox, fqdn)
-        print('Warmup complete.\n')
-
+    first_condition = True
     for name, rate, override_dur in CONDITIONS:
         duration = override_dur or args.duration
         print(f'\n=== Condition: {name} — {rate}/s for {duration}s ===')
 
         results = []
         errors = 0
+        warmup = args.warmup if first_condition else 0
+        first_condition = False
         try:
-            async for found, staleness in _run_condition(args.url, name, rate, duration):
+            async for found, staleness in _run_condition(args.url, name, rate, duration, warmup=warmup):
                 results.append((found, staleness))
                 if len(results) % 100 == 0:
                     print(f'  {len(results)} iterations...', end='\r')
