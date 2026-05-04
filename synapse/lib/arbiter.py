@@ -109,6 +109,7 @@ class Arbiter:
         self._loop = None  # set by install_loop_signal_handler
         self._router_pid = None
         self._control_channels = {}  # {worker_id: (router_fd, worker_fd)}
+        self._write_channels = {}    # {worker_id: (worker_fd, writer_fd)}
 
     def fork_workers(self, num_workers, listen_sock, uds_path, worker_main):
         '''
@@ -140,9 +141,14 @@ class Arbiter:
         for i in range(num_workers):
             router_end, worker_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             self._control_channels[i] = (router_end.fileno(), worker_end.fileno())
-            # Detach so Python doesn't close them
             router_end.detach()
             worker_end.detach()
+
+            # Write channel (worker → writer): for write forwarding
+            worker_write, writer_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._write_channels[i] = (worker_write.fileno(), writer_end.fileno())
+            worker_write.detach()
+            writer_end.detach()
 
         self._install_parent_signals()
 
@@ -182,6 +188,15 @@ class Arbiter:
                         except OSError:
                             pass
 
+                # Close all write channel fds in router (not needed)
+                for wid, (w_worker_fd, w_writer_fd) in self._write_channels.items():
+                    for fd in (w_worker_fd, w_writer_fd):
+                        if fd >= 0:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+
                 router = s_router.RouterProcess(listen_fd, worker_uds_fds)
                 router.router_main()
             except Exception:
@@ -206,7 +221,26 @@ class Arbiter:
                     pass
                 self._control_channels[wid] = (router_fd, -1)
 
+        # Close worker-end write fds in the parent (writer process).
+        # The writer keeps the writer-end fds for receiving write RPCs.
+        for wid, (w_worker_fd, w_writer_fd) in list(self._write_channels.items()):
+            if w_worker_fd >= 0:
+                try:
+                    os.close(w_worker_fd)
+                except OSError:
+                    pass
+                self._write_channels[wid] = (-1, w_writer_fd)
+
         return pid
+
+    def get_writer_fds(self):
+        '''Return a list of writer-end write channel fds.
+
+        These fds are used by the writer process to receive write RPCs
+        from workers via the write channel socketpairs.
+        '''
+        return [w_writer_fd for _, w_writer_fd in self._write_channels.values()
+                if w_writer_fd >= 0]
 
     # ------------------------------------------------------------------
     # internal fork helpers
@@ -250,9 +284,22 @@ class Arbiter:
                 except OSError:
                     pass
 
+        # Close writer-end fds and other workers' write fds in this child
+        for wid, (w_worker_fd, w_writer_fd) in self._write_channels.items():
+            try:
+                os.close(w_writer_fd)
+            except OSError:
+                pass
+            if wid != worker_id:
+                try:
+                    os.close(w_worker_fd)
+                except OSError:
+                    pass
+
         # Pass the worker's control channel fd instead of the listen fd
         control_fd = self._control_channels[worker_id][1]
-        self._worker_main(control_fd, self._uds_path, worker_id)
+        write_fd = self._write_channels[worker_id][0]
+        self._worker_main(control_fd, self._uds_path, worker_id, write_fd=write_fd)
 
     # ------------------------------------------------------------------
     # parent signal handlers
@@ -344,6 +391,12 @@ class Arbiter:
         router_end.detach()
         worker_end.detach()
 
+        # Create a fresh write channel socketpair
+        worker_write, writer_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._write_channels[idx] = (worker_write.fileno(), writer_end.fileno())
+        worker_write.detach()
+        writer_end.detach()
+
         pid = os.fork()
         if pid == 0:
             try:
@@ -358,6 +411,15 @@ class Arbiter:
 
         # Restart the router so it gets the new control channel fd
         self._restart_router()
+
+    def get_write_channel_fds(self):
+        '''Return {worker_id: writer_end_fd} for the writer process.
+
+        Called after fork_router() when the parent becomes the writer.
+        Only writer-end fds remain open at this point (worker-end fds
+        were closed in fork_router).
+        '''
+        return {wid: wfd for wid, (_, wfd) in self._write_channels.items() if wfd >= 0}
 
     def _restart_router(self):
         '''Kill the old router and fork a new one with current control channels.'''

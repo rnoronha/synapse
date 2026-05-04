@@ -4706,8 +4706,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         # reference so nothing accidentally uses it between phases.
         cell.loop = None
 
-        def _worker_entry(control_fd, uds_path_arg, worker_id):
-            s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell)
+        def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None):
+            s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell, write_fd=write_fd)
 
         arbiter = s_arbiter.Arbiter()
         arbiter.fork_workers(count, listen_fd, uds_path, _worker_entry)

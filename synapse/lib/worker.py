@@ -119,7 +119,7 @@ class CircuitBreaker:
 # Worker entry point (called after fork)
 # ---------------------------------------------------------------------------
 
-def worker_main(control_fd, uds_path, datadir, cell=None):
+def worker_main(control_fd, uds_path, datadir, cell=None, write_fd=None):
     '''
     Entry point for a forked read worker process.
 
@@ -128,6 +128,7 @@ def worker_main(control_fd, uds_path, datadir, cell=None):
         uds_path: Path to the writer's UDS endpoint for write forwarding.
         datadir: Cortex data directory (for LMDB slab re-open).
         cell: The inherited Cortex cell object (shared via dmon for telepath).
+        write_fd: File descriptor of the write channel socketpair to the writer.
     '''
     # Neutralize the inherited forkpool (stale threads/pipes after fork)
     import synapse.lib.processpool as s_processpool
@@ -151,7 +152,7 @@ def worker_main(control_fd, uds_path, datadir, cell=None):
                 obj.finievt = asyncio.Event()
         cell.loop = loop
 
-    worker = ReadOnlyWorker(control_fd, uds_path, cell=cell)
+    worker = ReadOnlyWorker(control_fd, uds_path, cell=cell, write_fd=write_fd)
     try:
         loop.run_until_complete(worker.serve())
     except KeyboardInterrupt:
@@ -214,10 +215,11 @@ class ReadOnlyWorker:
     the writer via Telepath-over-UDS.
     '''
 
-    def __init__(self, control_fd, uds_path, cell=None):
+    def __init__(self, control_fd, uds_path, cell=None, write_fd=None):
         self._control_fd = control_fd
         self._uds_path = uds_path
         self._cell = cell
+        self._write_fd = write_fd
         self._dmon = None
         self._writer_proxy = None
         self._circuit = CircuitBreaker(threshold=3, recovery_timeout=1.0)
