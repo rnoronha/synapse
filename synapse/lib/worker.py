@@ -154,28 +154,42 @@ def _reopen_lmdb_readonly(datadir):
     '''Re-open inherited LMDB slabs in readonly mode.
 
     The parent arbiter already closed the lenv handles before fork, so we
-    must NOT close them again (double-close).  We just collect the paths
-    from the inherited allslabs metadata, clear the stale entries, and
-    re-open fresh readonly environments.
+    must NOT close them again (double-close).  We reconnect each Slab
+    object to a fresh readonly LMDB environment so the inherited Cell
+    can serve reads through its normal data access layer.
     '''
-    paths = [slab.path for slab in s_lmdbslab.Slab.allslabs.values()]
-    s_lmdbslab.Slab.allslabs.clear()
+    for slab in list(s_lmdbslab.Slab.allslabs.values()):
+        path = slab.path
+        try:
+            slab.lenv = lmdb.open(
+                str(path),
+                map_size=0,
+                max_dbs=128,
+                max_readers=256,
+                readonly=True,
+                create=False,
+                readahead=False,
+            )
+            slab.isfini = False
+            slab.readonly = True
+            slab.xact = None
+            slab.txnrefcount = 0
 
-    for path in paths:
-        env = lmdb.open(
-            str(path),
-            map_size=0,  # use current file size; avoids MDB_MAP_RESIZED
-            max_dbs=128,
-            max_readers=256,
-            readonly=True,
-            create=False,
-            readahead=False,
-        )
-        _readonly_envs[path] = env
+            # Re-open all cached database handles against the new env
+            old_dbnames = dict(slab.dbnames)
+            slab.dbnames = {None: (None, False)}
+            for name, (db, dupsort) in old_dbnames.items():
+                if name is None:
+                    continue
+                try:
+                    newdb = slab.lenv.open_db(name.encode('utf8'), create=False, dupsort=dupsort)
+                    slab.dbnames[name] = (newdb, dupsort)
+                except Exception:
+                    logger.warning('Worker: failed to re-open db %s in slab %s', name, path)
 
-
-# Module-level registry of re-opened readonly LMDB environments
-_readonly_envs: dict[str, lmdb.Environment] = {}
+            logger.debug('Worker: re-opened slab %s readonly (%d dbs)', path, len(slab.dbnames) - 1)
+        except Exception:
+            logger.exception('Worker: failed to re-open slab %s', path)
 
 
 # ---------------------------------------------------------------------------
