@@ -471,8 +471,8 @@ fi
 # Dump cortex log tail for diagnostics on failure
 if [[ $TEST_EXIT -ne 0 ]]; then
     echo ""
-    echo "-- CORTEX LOG (last 30 lines) -----------------------------"
-    run_ssm "tail -30 /tmp/cortex.log" || true
+    echo "-- CORTEX LOG (last 100 lines) -----------------------------"
+    run_ssm "tail -100 /tmp/cortex.log" || true
 fi
 
 echo ""

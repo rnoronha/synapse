@@ -507,6 +507,7 @@ class Daemon(s_base.Base):
         try:
 
             if sidn is None or todo is None:
+                logger.error('t2:init REJECT: sidn=%s todo=%s name=%s (PATCHED-V2)', sidn, todo is not None, name)
                 raise s_exc.NoSuchObj(name=name)
 
             sess = self.sessions.get(sidn)
@@ -515,6 +516,7 @@ class Daemon(s_base.Base):
             # landed on a different fork worker), create one on-the-fly
             # using the shared item lookup — same as tele:syn would.
             if sess is None:
+                logger.warning('t2:init session miss (PATCHED-V2): sidn=%s name=%s, creating on-the-fly session', sidn, name)
                 item = await self._getSharedItem(name or '*')
                 if item is None:
                     raise s_exc.NoSuchObj(name=name)
