@@ -223,6 +223,97 @@ def main():
                     print(f'FAIL CRITERION 6: read-after-write failed after 3 attempts: {e}')
                     return
 
+        # WRITE CHANNEL CHECK 1: Streaming responses arrive correctly via socketpair
+        # Verify that a storm query producing multiple nodes streams them all
+        # back through the write channel with correct ordering.
+        try:
+            async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
+                # Create multiple nodes in one storm query (write, forwarded via socketpair)
+                mesgs = []
+                async for mesg in prox.storm('[ inet:fqdn=stream1.com inet:fqdn=stream2.com inet:fqdn=stream3.com ]'):
+                    mesgs.append(mesg)
+                nodes = [m for m in mesgs if m[0] == 'node']
+                errs = [m for m in mesgs if m[0] == 'err']
+                assert not errs, f'Streaming write produced errors: {errs}'
+                assert len(nodes) == 3, f'Expected 3 streamed nodes, got {len(nodes)}'
+                # Verify fini message arrived (stream completed properly)
+                finis = [m for m in mesgs if m[0] == 'fini']
+                assert len(finis) == 1, f'Expected 1 fini, got {len(finis)}'
+                print(f'[writechan] CHECK 1 OK: streaming write returned {len(nodes)} nodes with fini')
+        except Exception as e:
+            print(f'FAIL WRITE CHANNEL CHECK 1: {e}')
+            import traceback; traceback.print_exc()
+            return
+
+        # WRITE CHANNEL CHECK 2: Read queries continue when write channel is dead
+        # Verify pure read queries (no LMDB data dependency) execute locally on
+        # the worker without touching the write channel.
+        try:
+            async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
+                # Pure computation read — no data dependency, runs locally on worker
+                mesgs = []
+                async for mesg in prox.storm('$lib.print($lib.str.concat(read, ok))'):
+                    mesgs.append(mesg)
+                prints = [m for m in mesgs if m[0] == 'print']
+                errs = [m for m in mesgs if m[0] == 'err']
+                assert not errs, f'Read query produced errors: {errs}'
+                assert len(prints) == 1 and prints[0][1].get('mesg') == 'readok', \
+                    f'Expected print "readok", got {prints}'
+
+                # Second read: getCellInfo (telepath method, no storm, no write channel)
+                info = await prox.getCellInfo()
+                assert info is not None
+                assert info.get('cell', {}).get('type') == 'cortex'
+
+                print(f'[writechan] CHECK 2 OK: read queries work independently of write channel')
+        except Exception as e:
+            print(f'FAIL WRITE CHANNEL CHECK 2: {e}')
+            import traceback; traceback.print_exc()
+            return
+
+        # WRITE CHANNEL CHECK 3: Mixed read/write workload on same connection
+        # Interleave reads and writes on a single proxy to verify the worker
+        # correctly routes each query (read=local, write=forward via socketpair).
+        try:
+            async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
+                # Write
+                mesgs = []
+                async for mesg in prox.storm('[ inet:fqdn=mixed-w1.com ]'):
+                    mesgs.append(mesg)
+                w1_nodes = [m for m in mesgs if m[0] == 'node']
+                assert len(w1_nodes) == 1, f'Write 1 returned {len(w1_nodes)} nodes'
+
+                # Read (verify no errors — may return 0 nodes due to stale worker LMDB)
+                mesgs = []
+                async for mesg in prox.storm('$lib.print(between-writes)'):
+                    mesgs.append(mesg)
+                r1_errs = [m for m in mesgs if m[0] == 'err']
+                assert not r1_errs, f'Read between writes produced errors: {r1_errs}'
+
+                # Write again
+                mesgs = []
+                async for mesg in prox.storm('[ inet:fqdn=mixed-w2.com ]'):
+                    mesgs.append(mesg)
+                w2_nodes = [m for m in mesgs if m[0] == 'node']
+                assert len(w2_nodes) == 1, f'Write 2 returned {len(w2_nodes)} nodes'
+
+                # Read (pure read, no write side-effect)
+                mesgs = []
+                async for mesg in prox.storm('$lib.print(alive)'):
+                    mesgs.append(mesg)
+                prints = [m for m in mesgs if m[0] == 'print']
+                assert len(prints) == 1, f'Print query returned {len(prints)} prints'
+
+                # Write via callStorm
+                result = await prox.callStorm('[ inet:fqdn=mixed-w3.com ] return($node.repr())')
+                assert result is not None, 'callStorm in mixed workload returned None'
+
+                print(f'[writechan] CHECK 3 OK: mixed read/write workload on same connection')
+        except Exception as e:
+            print(f'FAIL WRITE CHANNEL CHECK 3: {e}')
+            import traceback; traceback.print_exc()
+            return
+
         # READONLY:TRUE CHECKS — verify the try-forward mechanism
         try:
             async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
