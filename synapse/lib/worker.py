@@ -230,6 +230,12 @@ class ReadOnlyWorker:
         self._write_sem = asyncio.Semaphore(5)
         loop = asyncio.get_running_loop()
 
+        # Patch the cell's storm/callStorm to intercept writes and forward
+        # them to the writer process via UDS.  This is the integration point:
+        # CoreApi.storm() → cell.storm() → our patched version.
+        if self._cell is not None:
+            self._install_write_forwarding()
+
         # Create a Dmon to serve the telepath protocol on accepted connections
         if self._cell is not None:
             self._dmon = await s_daemon.Daemon.anit()
@@ -301,48 +307,74 @@ class ReadOnlyWorker:
         link = await s_link.Link.anit(reader, writer)
         link.schedCoro(self._dmon._onLinkInit(link))
 
-    async def storm(self, text, opts=None):
+    def _install_write_forwarding(self):
+        '''Monkey-patch cell.storm() and cell.callStorm() to forward writes.
+
+        CoreApi.storm() calls self.cell.storm(), so patching the cell methods
+        is the minimal interception point that works with the existing dmon
+        pipeline.
         '''
-        Classify and execute a Storm query.
+        cell = self._cell
+        _orig_storm = cell.storm
+        _orig_callStorm = cell.callStorm
+        worker = self
 
-        Reads execute locally against readonly LMDB.
-        Writes forward to the writer via UDS.
-        '''
-        if classify(text) == 'write':
-            async for mesg in self._forward_write(text, opts):
-                yield mesg
-            return
+        async def _patched_storm(text, opts=None):
+            if classify(text) == 'write':
+                async for mesg in worker._forward_storm(text, opts):
+                    yield mesg
+                return
+            try:
+                async for mesg in _orig_storm(text, opts=opts):
+                    yield mesg
+            except s_exc.IsReadOnly:
+                async for mesg in worker._forward_storm(text, opts):
+                    yield mesg
 
-        try:
-            async for mesg in self._execute_read(text, opts):
-                yield mesg
-        except s_exc.IsReadOnly:
-            # classify() false negative — transparently retry via writer
-            async for mesg in self._forward_write(text, opts):
-                yield mesg
+        async def _patched_callStorm(text, opts=None):
+            if classify(text) == 'write':
+                return await worker._forward_callStorm(text, opts)
+            try:
+                return await _orig_callStorm(text, opts=opts)
+            except s_exc.IsReadOnly:
+                return await worker._forward_callStorm(text, opts)
 
-    async def _execute_read(self, text, opts):
-        '''Execute a read query locally against readonly LMDB snapshots.'''
-        # This will be wired to the Cortex's view.storm() in Phase 2
-        # when the worker inherits the full Cortex object graph.
-        # For Phase 1b, this is the integration point.
-        raise NotImplementedError('_execute_read requires Cortex view wiring (Phase 2)')
+        import types
+        cell.storm = _patched_storm
+        cell.callStorm = _patched_callStorm
 
-    async def _forward_write(self, text, opts):
-        '''Forward a write query to the writer process via UDS.'''
+    async def _forward_storm(self, text, opts):
+        '''Forward a storm query to the writer, yielding messages.'''
         if self._circuit.is_open:
             raise s_exc.SynErr(mesg='Writer unavailable (circuit breaker open)')
-
         try:
             await asyncio.wait_for(self._write_sem.acquire(), timeout=30.0)
         except asyncio.TimeoutError:
             raise s_exc.SynErr(mesg='Write forwarding backlogged')
-
         try:
             proxy = await self._get_writer_proxy()
             async for mesg in proxy.storm(text, opts=opts):
                 yield mesg
             self._circuit.record_success()
+        except (OSError, ConnectionError, asyncio.TimeoutError) as e:
+            self._circuit.record_failure()
+            raise s_exc.SynErr(mesg=f'Write forwarding failed: {e}')
+        finally:
+            self._write_sem.release()
+
+    async def _forward_callStorm(self, text, opts):
+        '''Forward a callStorm query to the writer, returning the result.'''
+        if self._circuit.is_open:
+            raise s_exc.SynErr(mesg='Writer unavailable (circuit breaker open)')
+        try:
+            await asyncio.wait_for(self._write_sem.acquire(), timeout=30.0)
+        except asyncio.TimeoutError:
+            raise s_exc.SynErr(mesg='Write forwarding backlogged')
+        try:
+            proxy = await self._get_writer_proxy()
+            result = await proxy.callStorm(text, opts=opts)
+            self._circuit.record_success()
+            return result
         except (OSError, ConnectionError, asyncio.TimeoutError) as e:
             self._circuit.record_failure()
             raise s_exc.SynErr(mesg=f'Write forwarding failed: {e}')

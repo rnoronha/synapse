@@ -168,6 +168,27 @@ def main():
             print(f'FAIL BUG 2: Telepath /cortex query failed: {e}')
             return
 
+        # CRITERION 6 CHECK: Write forwarding via UDS — read-after-write
+        try:
+            async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
+                # Write a node (should be forwarded to writer via UDS)
+                await prox.callStorm('[ inet:fqdn=write-test.com ]')
+                print(f'[phase3] Write forwarding: callStorm succeeded')
+
+                # Read it back (may hit worker's local readonly LMDB or writer)
+                found = False
+                async for mesg in prox.storm('inet:fqdn=write-test.com'):
+                    if mesg[0] == 'node':
+                        found = True
+                if found:
+                    print(f'[phase3] CRITERION 6 OK: read-after-write succeeded')
+                else:
+                    print(f'FAIL CRITERION 6: wrote write-test.com but read returned no node')
+                    return
+        except Exception as e:
+            print(f'FAIL CRITERION 6: read-after-write failed: {e}')
+            return
+
         # BUG 3 CHECK: Soak test — sustained load with multiple concurrent proxies
         # to stress pool link distribution across fork workers
         CONCURRENCY = 4
