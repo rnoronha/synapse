@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "synapse",
+  "project_id": "fb88a505-f1f6-4ca2-ad69-dcbec458c504"
+}
