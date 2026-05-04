@@ -213,9 +213,12 @@ class ReadOnlyWorker:
         listen_sock = socket.socket(fileno=self._listen_fd)
         listen_sock.setblocking(False)
 
-        # Register with EPOLLEXCLUSIVE to avoid thundering herd
+        # Register with EPOLLEXCLUSIVE to avoid thundering herd (3.12+)
         epoll = select.epoll()
-        epoll.register(self._listen_fd, select.EPOLLIN | select.EPOLLEXCLUSIVE)
+        flags = select.EPOLLIN
+        if hasattr(select, 'EPOLLEXCLUSIVE'):
+            flags |= select.EPOLLEXCLUSIVE
+        epoll.register(self._listen_fd, flags)
 
         logger.info('Worker %d: accepting connections', self._pid)
 
