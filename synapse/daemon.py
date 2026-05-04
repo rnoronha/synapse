@@ -510,12 +510,35 @@ class Daemon(s_base.Base):
                 raise s_exc.NoSuchObj(name=name)
 
             sess = self.sessions.get(sidn)
-            if sess is None:
-                raise s_exc.NoSuchObj(name=name)
 
-            item = sess.getSessItem(name)
-            if item is None:
-                raise s_exc.NoSuchObj(name=name)
+            # If the session doesn't exist locally (e.g. pool connection
+            # landed on a different fork worker), create one on-the-fly
+            # using the shared item lookup — same as tele:syn would.
+            if sess is None:
+                item = await self._getSharedItem(name or '*')
+                if item is None:
+                    raise s_exc.NoSuchObj(name=name)
+
+                sess = await Sess.anit()
+
+                async def sessfini():
+                    self.sessions.pop(sess.iden, None)
+
+                sess.onfini(sessfini)
+                link.onfini(sess.fini)
+                self.sessions[sess.iden] = sess
+
+                if isinstance(item, s_telepath.Aware):
+                    item = await s_coro.ornot(item.getTeleApi, link, mesg, ())
+                    if isinstance(item, s_base.Base):
+                        link.onfini(item)
+
+                sess.setSessItem(name, item)
+
+            else:
+                item = sess.getSessItem(name)
+                if item is None:
+                    raise s_exc.NoSuchObj(name=name)
 
             s_scope.set('sess', sess)
             s_scope.set('link', link)
