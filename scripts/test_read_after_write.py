@@ -140,6 +140,8 @@ async def main():
     parser.add_argument('url', help='Telepath URL of the Cortex (e.g. tcp://host:port/cortex)')
     parser.add_argument('--duration', type=int, default=300,
                         help='Seconds per condition (default: 300, sustained always 1h)')
+    parser.add_argument('--warmup', type=int, default=10,
+                        help='Number of unmeasured warmup iterations (default: 10)')
     parser.add_argument('--output', type=str, default=None,
                         help='Path to write JSON results')
     args = parser.parse_args()
@@ -150,6 +152,18 @@ async def main():
 
     all_stats = {}
     all_raw = {}
+
+    # Warmup: throwaway read+write ops to warm the LMDB page cache
+    if args.warmup > 0:
+        print(f'\nWarmup: {args.warmup} iterations (not measured)...')
+        ts = int(time.time())
+        async with await s_telepath.openurl(args.url) as prox:
+            for i in range(args.warmup):
+                if _shutdown.is_set():
+                    break
+                fqdn = f'raw-warmup-{ts}-{i}.test.com'
+                await _write_and_read(prox, fqdn)
+        print('Warmup complete.\n')
 
     for name, rate, override_dur in CONDITIONS:
         duration = override_dur or args.duration

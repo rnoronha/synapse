@@ -154,6 +154,8 @@ async def main():
                         help='Percentage of operations that are writes (default: 10)')
     parser.add_argument('--duration', type=int, default=60,
                         help='Test duration in seconds (default: 60)')
+    parser.add_argument('--warmup', type=int, default=30,
+                        help='Warmup period in seconds excluded from stats (default: 30)')
     parser.add_argument('--output', type=str, default=None,
                         help='Path to write JSON results')
     parser.add_argument('--max-error-pct', type=float, default=1.0,
@@ -176,11 +178,32 @@ async def main():
     async with await s_telepath.openurl(args.url) as prox:
         print(f'Connected to {args.url}')
         print(f'Concurrency: {args.concurrency}  Write%: {args.write_pct}  '
-              f'Duration: {args.duration}s')
+              f'Duration: {args.duration}s  Warmup: {args.warmup}s')
 
         print('\nSeeding data:')
         await _seed_nodes(prox)
         print()
+
+        # Warmup: run workloads but discard stats
+        if args.warmup > 0:
+            warmup_stats = Stats()
+            warmup_sem = asyncio.Semaphore(args.concurrency)
+            warmup_pending: set[asyncio.Task] = set()
+            t_warmup = time.monotonic()
+            while not _shutdown.is_set() and (time.monotonic() - t_warmup) < args.warmup:
+                task = asyncio.create_task(_run_op(prox, warmup_sem, warmup_stats, args.write_pct))
+                warmup_pending.add(task)
+                task.add_done_callback(warmup_pending.discard)
+                if len(warmup_pending) >= args.concurrency:
+                    done, warmup_pending = await asyncio.wait(
+                        warmup_pending, return_when=asyncio.FIRST_COMPLETED)
+            if warmup_pending:
+                await asyncio.wait(warmup_pending)
+            wr, ww = await warmup_stats.snapshot()
+            print(f'Warmup complete: {len(wr)} reads, {len(ww)} writes (discarded)\n')
+            if _shutdown.is_set():
+                print('Shutdown during warmup.')
+                return 1
 
         t_start = time.monotonic()
         next_status = t_start + 10
