@@ -287,7 +287,13 @@ class ReadOnlyWorker:
         if self._write_fd is not None:
             self._reader_task = asyncio.get_running_loop().create_task(self._demux_reader())
 
+        def _refresh_all_ro_slabs():
+            for slab in s_lmdbslab.Slab.allslabs.values():
+                if slab.readonly:
+                    slab._refresh_ro_xact()
+
         async def _patched_storm(text, opts=None):
+            _refresh_all_ro_slabs()
             if classify(text) == 'write':
                 async for mesg in worker._forward_write_stream(text, opts):
                     yield mesg
@@ -304,6 +310,7 @@ class ReadOnlyWorker:
                 yield mesg
 
         async def _patched_callStorm(text, opts=None):
+            _refresh_all_ro_slabs()
             if classify(text) == 'write':
                 return await worker._forward_callStorm(text, opts)
 
