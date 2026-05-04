@@ -163,6 +163,8 @@ class Arbiter:
         '''
         import synapse.lib.router as s_router
 
+        self._listen_fd = listen_fd
+
         # Build {worker_id: router_end_fd} map
         worker_uds_fds = {}
         for wid, (router_fd, worker_fd) in self._control_channels.items():
@@ -174,10 +176,11 @@ class Arbiter:
             try:
                 # Close worker-end fds in router process
                 for wid, (_, worker_fd) in self._control_channels.items():
-                    try:
-                        os.close(worker_fd)
-                    except OSError:
-                        pass
+                    if worker_fd >= 0:
+                        try:
+                            os.close(worker_fd)
+                        except OSError:
+                            pass
 
                 router = s_router.RouterProcess(listen_fd, worker_uds_fds)
                 router.router_main()
@@ -189,6 +192,20 @@ class Arbiter:
         # --- parent (arbiter) ---
         self._router_pid = pid
         logger.info('Forked router (pid %d)', pid)
+
+        # F-2 fix: Close the worker-end fds in the parent. The router
+        # detects dead workers via EPOLLHUP on the router-end fd, which
+        # only fires when ALL worker-end fds are closed. Without this,
+        # the parent's copy keeps the socketpair alive and HUP never fires.
+        # We keep the router-end fds so _restart_router can re-fork.
+        for wid, (router_fd, worker_fd) in list(self._control_channels.items()):
+            if worker_fd >= 0:
+                try:
+                    os.close(worker_fd)
+                except OSError:
+                    pass
+                self._control_channels[wid] = (router_fd, -1)
+
         return pid
 
     # ------------------------------------------------------------------
@@ -312,10 +329,20 @@ class Arbiter:
     # ------------------------------------------------------------------
 
     def restart_worker(self, idx):
-        '''Respawn the worker at slot *idx*.'''
+        '''Respawn the worker at slot *idx* with a fresh socketpair.
+
+        F-5 fix: The old socketpair is dead. Create a new one, fork the
+        worker, then restart the router so it picks up the new fd.
+        '''
         old_pid = self._worker_pids[idx]
         if old_pid is not None:
             logger.warning('restart_worker called for slot %d but pid %d still tracked', idx, old_pid)
+
+        # Create a fresh socketpair for this worker
+        router_end, worker_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._control_channels[idx] = (router_end.fileno(), worker_end.fileno())
+        router_end.detach()
+        worker_end.detach()
 
         pid = os.fork()
         if pid == 0:
@@ -328,6 +355,24 @@ class Arbiter:
 
         self._worker_pids[idx] = pid
         logger.info('Respawned worker slot %d as pid %d', idx, pid)
+
+        # Restart the router so it gets the new control channel fd
+        self._restart_router()
+
+    def _restart_router(self):
+        '''Kill the old router and fork a new one with current control channels.'''
+        if self._router_pid is not None:
+            try:
+                os.kill(self._router_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self._router_pid, 0)
+            except ChildProcessError:
+                pass
+            self._router_pid = None
+
+        self.fork_router(self._listen_fd)
 
     def shutdown(self):
         '''Send SIGTERM to router first, then workers, wait with timeout, SIGKILL stragglers.'''

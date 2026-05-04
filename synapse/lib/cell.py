@@ -4755,8 +4755,10 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             except OSError:
                 logger.warning('Failed to re-create local unix socket')
 
-            # Re-create the TCP listener on the inherited (shared) socket fd
-            await cell._restoreDmonListener(listen_fd)
+            # F-1 fix: The router owns the listen socket now. Close our copy
+            # so the writer does NOT accept TCP connections directly.
+            os.close(listen_fd)
+
             # Re-create the UDS listener for write forwarding
             await cell.dmon.listen(f'unix://{uds_path}')
 

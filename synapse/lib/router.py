@@ -49,6 +49,12 @@ class RouterProcess:
         self._rr_index = 0
         self._stopping = False
 
+        # F-8 fix: Set all worker UDS fds non-blocking so a slow worker
+        # cannot stall the entire router's accept loop.
+        for fd in self._worker_fds.values():
+            os.set_inheritable(fd, False)
+            os.set_blocking(fd, False)
+
     def router_main(self):
         '''Entry point after fork. Blocks until shutdown.'''
         os.setsid()
@@ -149,21 +155,33 @@ class RouterProcess:
             return
 
         conn_fd = conn.fileno()
-        worker = self._next_worker()
-        if worker is None:
-            conn.close()
-            return
 
-        uds_fd = self._worker_fds[worker]
-        uds_sock = socket.socket(fileno=uds_fd)
-        try:
-            send_fd(uds_sock, conn_fd)
-        except OSError:
-            logger.warning('Router: sendmsg to worker %d failed', worker)
-            self._alive.discard(worker)
-        finally:
-            uds_sock.detach()
-            conn.close()
+        # F-8 fix: Try round-robin workers; skip any whose UDS would block.
+        pool = sorted(self._alive & self._ready)
+        dispatched = False
+        for _ in range(len(pool)):
+            worker = self._next_worker()
+            if worker is None:
+                break
+            uds_fd = self._worker_fds[worker]
+            uds_sock = socket.socket(fileno=uds_fd)
+            try:
+                send_fd(uds_sock, conn_fd)
+                dispatched = True
+            except BlockingIOError:
+                logger.debug('Router: worker %d UDS full, skipping', worker)
+            except OSError:
+                logger.warning('Router: sendmsg to worker %d failed', worker)
+                self._alive.discard(worker)
+            finally:
+                uds_sock.detach()
+            if dispatched:
+                break
+
+        if not dispatched:
+            logger.warning('Router: no worker could accept connection, dropping')
+
+        conn.close()
 
     def _next_worker(self):
         '''Round-robin, skip dead workers.'''

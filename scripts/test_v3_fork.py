@@ -163,7 +163,8 @@ def main():
             await cell.dmon.listen(f'unix://{os.path.join(cell.dirn, "sock")}')
         except OSError:
             pass
-        await cell._restoreDmonListener(listen_fd)
+        # F-1 fix: Router owns the listen socket. Close our copy.
+        os.close(listen_fd)
         await cell.dmon.listen(f'unix://{uds_path}')
 
         # Match real cell.py: re-fire active coros and start the nexus
