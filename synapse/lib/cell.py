@@ -4706,117 +4706,60 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         # reference so nothing accidentally uses it between phases.
         cell.loop = None
 
-        logger.critical('Phase 2: forking %d workers, listen_fd=%d, uds=%s', count, listen_fd, uds_path)
-
         def _worker_entry(listen_sock, uds_path_arg, worker_id):
             s_worker.worker_main(listen_sock, uds_path_arg, datadir, cell=cell)
 
         arbiter = s_arbiter.Arbiter()
-        try:
-            arbiter.fork_workers(count, listen_fd, uds_path, _worker_entry)
-            logger.critical('Phase 2 OK: workers forked, pids=%s', arbiter._worker_pids)
-        except Exception:
-            logger.critical('CRASH at Phase 2: fork_workers', exc_info=True)
-            raise
-
-        logger.critical('Phase 3: entering _writer_serve')
+        arbiter.fork_workers(count, listen_fd, uds_path, _worker_entry)
 
         # Phase 3: Writer process creates a new event loop and serves
         async def _writer_serve():
 
-            logger.critical('_writer_serve step 1: rebinding Base objects to new event loop')
-            try:
-                import gc
-                new_loop = asyncio.get_running_loop()
-                rebound = 0
-                for obj in gc.get_objects():
-                    if isinstance(obj, s_base.Base) and obj.anitted:
-                        obj.loop = new_loop
-                        obj.finievt = asyncio.Event()
-                        rebound += 1
-                cell.loop = new_loop
-                logger.critical('_writer_serve step 1 OK: rebound %d Base objects', rebound)
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 1: rebind Base objects', exc_info=True)
-                raise
+            # E-1 fix: Rebind ALL Base objects to the new event loop.
+            # The init loop is dead; every Base created during init has a
+            # stale loop reference.
+            import gc
+            new_loop = asyncio.get_running_loop()
+            for obj in gc.get_objects():
+                if isinstance(obj, s_base.Base) and obj.anitted:
+                    obj.loop = new_loop
+                    obj.finievt = asyncio.Event()
+            cell.loop = new_loop
 
-            logger.critical('_writer_serve step 2: decrement _syn_refs')
-            try:
-                cell._syn_refs -= 1
-                logger.critical('_writer_serve step 2 OK: _syn_refs=%d', cell._syn_refs)
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 2: decrement _syn_refs', exc_info=True)
-                raise
+            # E-2 fix: Decrement the extra ref we added in _initForFork
+            # to prevent fini during asyncio.run() teardown.
+            cell._syn_refs -= 1
 
-            logger.critical('_writer_serve step 3: reopen writer slabs')
-            try:
-                s_arbiter._reopen_writer_slabs()
-                logger.critical('_writer_serve step 3 OK: slabs reopened')
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 3: reopen writer slabs', exc_info=True)
-                raise
+            # E-3 fix: Re-open LMDB slabs closed before fork.
+            s_arbiter._reopen_writer_slabs()
 
-            logger.critical('_writer_serve step 4: install loop signal handler')
-            try:
-                arbiter.install_loop_signal_handler(cell.loop)
-                logger.critical('_writer_serve step 4 OK: SIGCHLD handler installed')
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 4: install loop signal handler', exc_info=True)
-                raise
+            # S-1 fix: Replace the raw signal.signal SIGCHLD handler with
+            # a loop-based handler so restarts happen from the event loop,
+            # not inside a signal handler (which is undefined behavior).
+            arbiter.install_loop_signal_handler(cell.loop)
 
-            logger.critical('_writer_serve step 5: clear stale server refs and UDS files')
-            try:
-                cell.dmon.listenservers.clear()
-                for spath in (os.path.join(cell.dirn, 'sock'), uds_path):
-                    try:
-                        os.unlink(spath)
-                    except FileNotFoundError:
-                        pass
-                logger.critical('_writer_serve step 5 OK: stale refs cleared')
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 5: clear stale refs', exc_info=True)
-                raise
+            # Clear stale server refs and UDS files from the init loop
+            cell.dmon.listenservers.clear()
+            for spath in (os.path.join(cell.dirn, 'sock'), uds_path):
+                try:
+                    os.unlink(spath)
+                except FileNotFoundError:
+                    pass
 
-            logger.critical('_writer_serve step 6: re-create local unix socket')
+            # Re-create the local unix socket
             try:
                 await cell.dmon.listen(f'unix://{os.path.join(cell.dirn, "sock")}')
-                logger.critical('_writer_serve step 6 OK: local unix socket created')
             except OSError:
                 logger.warning('Failed to re-create local unix socket')
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 6: local unix socket', exc_info=True)
-                raise
 
-            logger.critical('_writer_serve step 7: restore TCP listener on fd %d', listen_fd)
-            try:
-                await cell._restoreDmonListener(listen_fd)
-                logger.critical('_writer_serve step 7 OK: TCP listener restored')
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 7: restore TCP listener', exc_info=True)
-                raise
+            # Re-create the TCP listener on the inherited (shared) socket fd
+            await cell._restoreDmonListener(listen_fd)
+            # Re-create the UDS listener for write forwarding
+            await cell.dmon.listen(f'unix://{uds_path}')
 
-            logger.critical('_writer_serve step 8: re-create UDS listener at %s', uds_path)
-            try:
-                await cell.dmon.listen(f'unix://{uds_path}')
-                logger.critical('_writer_serve step 8 OK: UDS listener created')
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 8: UDS listener', exc_info=True)
-                raise
-
-            logger.critical('_writer_serve step 9: fire active coros')
-            try:
-                cell._fireActiveCoros()
-                logger.critical('_writer_serve step 9 OK: active coros fired')
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 9: fire active coros', exc_info=True)
-                raise
-
-            logger.critical('_writer_serve step 10: calling cell.main()')
-            try:
-                await cell.main()
-            except Exception:
-                logger.critical('CRASH at _writer_serve step 10: cell.main()', exc_info=True)
-                raise
+            # Re-fire active coros that were cancelled when the init loop closed
+            cell._fireActiveCoros()
+            await cell.main()
 
         try:
             asyncio.run(_writer_serve())
@@ -4863,35 +4806,21 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         if outp is None:
             outp = s_output.stdout
 
-        logger.critical('_initForFork step A: initFromArgv')
-        try:
-            cell = await cls.initFromArgv(argv, outp=outp)
-            logger.critical('_initForFork step A OK: cell initialized')
-        except Exception:
-            logger.critical('CRASH at _initForFork step A: initFromArgv', exc_info=True)
-            raise
+        cell = await cls.initFromArgv(argv, outp=outp)
 
-        logger.critical('_initForFork step B: prepareFork')
-        try:
-            fork_info = None
-            if hasattr(cell, 'prepareFork'):
-                fork_info = await cell.prepareFork()
-            logger.critical('_initForFork step B OK: fork_info=%s', fork_info is not None)
-        except Exception:
-            logger.critical('CRASH at _initForFork step B: prepareFork', exc_info=True)
-            raise
+        # prepareFork() finalizes fork setup (UDS listener, socket fd lookup)
+        # after all init phases (including network) have completed.
+        fork_info = None
+        if hasattr(cell, 'prepareFork'):
+            fork_info = await cell.prepareFork()
 
-        logger.critical('_initForFork step C: dup listen fd')
-        try:
-            if fork_info is not None:
-                fork_info['listen_fd'] = os.dup(fork_info['listen_fd'])
-            logger.critical('_initForFork step C OK')
-        except Exception:
-            logger.critical('CRASH at _initForFork step C: dup listen fd', exc_info=True)
-            raise
+        if fork_info is not None:
+            # Dup the listen fd so it survives event loop teardown.
+            fork_info['listen_fd'] = os.dup(fork_info['listen_fd'])
 
+        # Prevent the cell (and its children) from being fini'd during
+        # asyncio.run() teardown.
         cell._syn_refs += 1
-        logger.critical('_initForFork complete: _syn_refs=%d', cell._syn_refs)
 
         return {'cell': cell, 'fork_info': fork_info}
 
