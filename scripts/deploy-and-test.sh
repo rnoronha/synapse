@@ -405,7 +405,8 @@ echo ""
 echo "── PHASE 5: RUN TEST ($TEST) ──────────────────────────────"
 
 WRITER_URL="tcp://127.0.0.1:27492/cortex"
-READER_URL="tcp://127.0.0.1:27493/cortex"
+# Fork mode: readers share port 27492 via EPOLLEXCLUSIVE (no separate reader port)
+READER_URL="tcp://127.0.0.1:27492/cortex"
 OUTPUT_FLAG="--output /tmp/test-results.json"
 
 case $TEST in
@@ -476,11 +477,11 @@ if [[ $TEST_EXIT -ne 0 ]]; then
 fi
 
 echo ""
-echo "═══════════════════════════════════════════════════════════"
+echo "==========================================================="
 if [[ $TEST_EXIT -eq 0 ]]; then
-    echo "  PASS — $TEST test finished"
+    echo "  PASS -- $TEST test finished"
 else
-    echo "  FAIL — $TEST test exited $TEST_EXIT"
+    echo "  FAIL -- $TEST test exited $TEST_EXIT"
 fi
-echo "═══════════════════════════════════════════════════════════"
+echo "==========================================================="
 exit $TEST_EXIT

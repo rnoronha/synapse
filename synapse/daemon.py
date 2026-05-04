@@ -515,23 +515,30 @@ class Daemon(s_base.Base):
             # landed on a different fork worker), create one on-the-fly
             # using the shared item lookup — same as tele:syn would.
             if sess is None:
-                logger.debug('t2:init session miss: sidn=%s name=%s, creating on-the-fly session', sidn, name)
-                item = await self._getSharedItem(name or '*')
-                if item is None:
-                    raise s_exc.NoSuchObj(name=name)
 
-                sess = await Sess.anit()
+                # Re-use a session already created for this link to avoid
+                # accumulating one Sess per t2:init under sustained load.
+                sess = link.get('sess')
+                if sess is not None:
+                    item = sess.getSessItem(name)
+                    if item is None:
+                        raise s_exc.NoSuchObj(name=name)
+                else:
+                    item = await self._getSharedItem(name or '*')
+                    if item is None:
+                        raise s_exc.NoSuchObj(name=name)
 
-                async def sessfini():
-                    self.sessions.pop(sess.iden, None)
+                    sess = await Sess.anit()
 
-                sess.onfini(sessfini)
-                link.onfini(sess.fini)
-                self.sessions[sess.iden] = sess
+                    async def sessfini():
+                        self.sessions.pop(sess.iden, None)
 
-                # Store the shared item directly — pool connections were
-                # already authenticated on the original tele:syn link.
-                sess.setSessItem(name, item)
+                    sess.onfini(sessfini)
+                    link.onfini(sess.fini)
+                    self.sessions[sess.iden] = sess
+                    link.set('sess', sess)
+
+                    sess.setSessItem(name, item)
 
             else:
                 item = sess.getSessItem(name)

@@ -11,10 +11,15 @@ BUG 2: NoSuchObj: name=None — workers accept connections but cortex share
   Root cause: worker dmon only shared '*', not 'cortex' or other names.
   Fix: worker copies all parent dmon share names to its own dmon.
 
+BUG 3: ~50% error rate under sustained soak load.
+  Pool links (t2:init) land on different fork workers than the original
+  tele:syn handshake.  The on-the-fly session bypasses getTeleApi() and
+  stores the raw Cell instead of a CoreApi, causing auth/method failures.
+
 This test replicates the exact fork sequence from cell.py startmain:
   Phase 1: asyncio.run(init) — init Cortex, loop closes on return
   Phase 2: os.fork() × N — fork read workers
-  Phase 3: asyncio.run(serve) — writer event loop
+  Phase 3: asyncio.run(serve) — writer event loop + soak test
 '''
 import io
 import os
@@ -35,6 +40,7 @@ import synapse.lib.worker as s_worker
 
 NUM_WORKERS = 2
 WORKER_SETTLE_TIME = 3.0
+SOAK_DURATION = 30
 
 
 def main():
@@ -65,6 +71,12 @@ def main():
 
         uds_path = os.path.join(td, 'worker.sock')
         await core.dmon.listen(f'unix://{uds_path}')
+
+        # Seed test data
+        async with await core.snap() as snap:
+            for i in range(20):
+                await snap.addNode('inet:fqdn', f'test{i}.example.com')
+
         dup_fd = os.dup(listen_fd)
         core._syn_refs += 1  # prevent fini during asyncio.run teardown
 
@@ -81,9 +93,6 @@ def main():
     print(f'[phase1] Done. port={port} isfini={cell.isfini} refs={cell._syn_refs}')
 
     # Phase 2: Fork workers (mirrors _runForkMode)
-    # Reset log capture AFTER phase 1 — the init loop teardown legitimately
-    # kills forkserver pool workers (SpawnProcess-*). We only care about
-    # SIGTERM happening AFTER fork.
     stderr_capture.truncate(0)
     stderr_capture.seek(0)
 
@@ -107,29 +116,17 @@ def main():
             dead.append(pid)
 
     if dead:
-        print(f'FAIL BUG 1: {len(dead)} worker(s) died within {WORKER_SETTLE_TIME}s (SIGTERM during startup)')
-        for pid in dead:
-            try:
-                rpid, status = os.waitpid(pid, os.WNOHANG)
-                if rpid != 0:
-                    if os.WIFSIGNALED(status):
-                        print(f'  pid {pid}: signal {os.WTERMSIG(status)}')
-                    else:
-                        print(f'  pid {pid}: exit code {os.WEXITSTATUS(status)}')
-            except ChildProcessError:
-                print(f'  pid {pid}: already reaped')
+        print(f'FAIL BUG 1: {len(dead)} worker(s) died within {WORKER_SETTLE_TIME}s')
         os._exit(1)
 
-    print(f'[check] BUG 1 OK: All {NUM_WORKERS} workers alive (no SIGTERM)')
+    print(f'[check] BUG 1 OK: All {NUM_WORKERS} workers alive')
 
-    # Check captured logs for SIGTERM evidence
     captured = stderr_capture.getvalue()
     if 'SIGTERM' in captured or 'SpawnProcess' in captured:
         print(f'FAIL BUG 1: SIGTERM or SpawnProcess found in logs')
-        print(captured[:500])
         os._exit(1)
 
-    # Phase 3: Writer serves, verify telepath (BUG 2 check)
+    # Phase 3: Writer serves, verify telepath + soak test
     test_ok = False
 
     async def writer_serve():
@@ -160,28 +157,71 @@ def main():
         await cell.dmon.listen(f'unix://{uds_path}')
 
         # BUG 2 CHECK: Verify telepath query with specific name 'cortex'
-        # This is the exact pattern that triggers NoSuchObj: name=None
         try:
             async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
                 info = await prox.getCellInfo()
-                assert info is not None, 'getCellInfo returned None'
+                assert info is not None
                 ctype = info.get('cell', {}).get('type', '')
                 assert ctype == 'cortex', f'Expected cortex, got {ctype}'
-                print(f'[phase3] BUG 2 OK: Telepath /cortex query succeeded (type={ctype})')
+                print(f'[phase3] BUG 2 OK: Telepath /cortex query succeeded')
         except Exception as e:
             print(f'FAIL BUG 2: Telepath /cortex query failed: {e}')
             return
 
-        # Verify workers still alive after serving
+        # BUG 3 CHECK: Soak test — sustained load with multiple concurrent proxies
+        # to stress pool link distribution across fork workers
+        CONCURRENCY = 4
+        print(f'[soak] Running {SOAK_DURATION}s sustained load test ({CONCURRENCY} concurrent proxies)...')
+        errors = 0
+        total = 0
+        error_types = {}
+        lock = asyncio.Lock()
+
+        async def soak_worker(worker_id):
+            nonlocal errors, total
+            deadline = time.monotonic() + SOAK_DURATION
+            async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
+                while time.monotonic() < deadline:
+                    async with lock:
+                        total += 1
+                        my_total = total
+                    try:
+                        count = 0
+                        async for mesg in prox.storm('inet:fqdn | limit 5'):
+                            if mesg[0] == 'node':
+                                count += 1
+                    except Exception as e:
+                        async with lock:
+                            errors += 1
+                            my_errors = errors
+                            etype = f'{type(e).__name__}: {e}'
+                            error_types[etype] = error_types.get(etype, 0) + 1
+                            if my_errors <= 5:
+                                print(f'  Error {my_errors} (w{worker_id}): {etype}')
+                    await asyncio.sleep(0.01)
+
+        await asyncio.gather(*[soak_worker(i) for i in range(CONCURRENCY)])
+
+        rate = errors / total * 100 if total else 0
+        print(f'[soak] Total: {total}, Errors: {errors}, Rate: {rate:.1f}%')
+        if error_types:
+            print(f'[soak] Error breakdown:')
+            for etype, cnt in sorted(error_types.items(), key=lambda x: -x[1]):
+                print(f'  {cnt:4d}x {etype}')
+
+        if rate > 1.0:
+            print(f'FAIL BUG 3: Error rate {rate:.1f}% exceeds 1% threshold')
+        else:
+            print(f'[soak] BUG 3 OK: Error rate {rate:.1f}% < 1%')
+            test_ok = True
+
+        # Verify workers still alive
         for pid in pids:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                print(f'FAIL: worker {pid} died during phase 3')
-                return
-
-        print(f'[phase3] All workers still alive')
-        test_ok = True
+                print(f'FAIL: worker {pid} died during soak')
+                test_ok = False
 
         arbiter.shutdown()
         await cell.fini()
@@ -196,7 +236,7 @@ def main():
                 pass
 
     if test_ok:
-        print('\nPASS: Both bugs fixed — no SIGTERM, telepath queries succeed')
+        print('\nPASS: All bugs fixed')
         os._exit(0)
     else:
         print('\nFAIL: Test did not complete successfully')
