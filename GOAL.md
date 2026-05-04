@@ -1,28 +1,29 @@
-# Goal: Thin Routing Layer — Separate Read/Write Paths
+# Goal: Thin Router Process — FD Passing to Workers
 
 ## End State
-A dedicated router process accepts all client connections, classifies queries, and routes reads to fork workers and writes directly to the writer. Workers become pure readers with no write forwarding code. The writer is freed from read traffic and can be maxed out on writes.
+A dedicated router process accepts all client TCP connections, then passes the file descriptor to the appropriate target via sendmsg/SCM_RIGHTS over per-worker UDS control channels. Workers receive the fd, complete the telepath handshake, and serve the full session. The writer process receives write-connection fds directly. No stream proxying — zero-copy connection handoff.
 
 ## Acceptance Criteria
-(To be defined after research — open questions below)
-
-## Open Questions (must answer before finalizing criteria)
-1. Separate process vs thread for the router?
-2. FD passing (sendmsg/SCM_RIGHTS) vs stream proxy for routing connections?
-3. How does this interact with Storm Pool mirror offloading (cortex.py stormpool)?
-4. Can the router unify local fork routing with cross-host Storm Pool?
-5. What's the write throughput ceiling with a dedicated writer (no read contention)?
+1. Router process accepts connections on the public port (27492)
+2. Router passes connection fds to workers via sendmsg/SCM_RIGHTS over UDS
+3. Workers receive fds, complete telepath handshake, serve read queries locally
+4. Write connections are passed to the writer process (not workers)
+5. No throughput regression: >1400 QPS parallel reads on c5.4xlarge
+6. No soak regression: <1% error rate under sustained load
+7. Write throughput improvement: >50 write ops/s (currently ~10 via UDS proxy)
+8. Workers have NO write forwarding code (pure readers)
+9. Local test_v3_fork.py passes with router architecture
 
 ## Constraints
 - Python 3.11
-- Single client-facing URL preserved
-- Must not regress read throughput (<1400 QPS)
-- Must not regress soak error rate (<1%)
+- Single client-facing URL (port 27492)
+- sendmsg/SCM_RIGHTS requires Unix domain sockets (Linux only — fine for our deployment)
+- Storm Pool remains independent (not merged into router)
 
 ## Out of Scope
-- Changes to the telepath protocol
-- External proxy software (HAProxy, nginx)
+- Cross-host routing (Storm Pool handles that)
 - Client-side routing
+- External proxy software
 
 ## Revision History
-- 2026-05-04 — Initial goal (pre-research, acceptance criteria TBD)
+- 2026-05-04 — Initial goal after research (thin-router-research.md)

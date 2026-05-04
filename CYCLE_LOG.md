@@ -9,3 +9,19 @@
 - Next action: research — answer the 5 open questions
 
 ### Dispatched
+
+### Results
+- research-router: 5 questions answered. Recommendations: separate process, FD passing (Option C), keep Storm Pool independent, keep local/remote separate, write ceiling is LMDB-bound.
+- GOAL.md finalized with 9 acceptance criteria.
+
+### Next
+- Design the router process architecture
+
+## Cycle 2 — 2026-05-04T13:39Z
+
+### Orient
+- Goal: thin router with FD passing. Research complete. Design needed.
+- Open questions resolved. Architecture: router accepts → sendmsg fd → worker/writer serves.
+- Next action: design
+
+### Dispatched
