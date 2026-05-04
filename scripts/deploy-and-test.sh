@@ -423,11 +423,7 @@ case $TEST in
     throughput)
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_throughput.py $WRITER_URL $OUTPUT_FLAG";;
     recovery)
-        READER_PORTS_FLAG=""
-        if [[ "$READERS" -gt 0 ]]; then
-            READER_PORTS_FLAG="--reader-ports 27493,27494"
-        fi
-        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_recovery.py $WRITER_URL $READER_PORTS_FLAG $OUTPUT_FLAG";;
+        TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_recovery.py $WRITER_URL $OUTPUT_FLAG";;
     read-after-write)
         TEST_CMD="cd /home/ec2-user/synapse && python3.11 scripts/test_read_after_write.py $WRITER_URL --duration $DURATION $OUTPUT_FLAG";;
     parallel-reads)

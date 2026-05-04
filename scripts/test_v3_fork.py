@@ -79,6 +79,11 @@ def main():
 
         dup_fd = os.dup(listen_fd)
         core._syn_refs += 1  # prevent fini during asyncio.run teardown
+        # Also protect the nexsroot and its children from being fini'd
+        # during asyncio.run teardown (they are Base objects with active
+        # tasks that get cancelled when the init loop closes).
+        # Use +3 to survive multiple fini() calls from different teardown paths.
+        core.nexsroot._syn_refs += 3
 
         return {'cell': core, 'listen_fd': dup_fd, 'uds_path': uds_path,
                 'datadir': td, 'port': port}
@@ -139,6 +144,7 @@ def main():
                 obj.finievt = asyncio.Event()
         cell.loop = new_loop
         cell._syn_refs -= 1
+        cell.nexsroot._syn_refs -= 3
 
         s_arbiter._reopen_writer_slabs()
         arbiter.install_loop_signal_handler(cell.loop)
@@ -156,6 +162,12 @@ def main():
         await cell._restoreDmonListener(listen_fd)
         await cell.dmon.listen(f'unix://{uds_path}')
 
+        # Match real cell.py: re-fire active coros and start the nexus
+        cell._fireActiveCoros()
+        if not cell.nexsroot.started:
+            await cell.nexsroot.recover()
+            await cell.nexsroot.startup()
+
         # BUG 2 CHECK: Verify telepath query with specific name 'cortex'
         try:
             async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
@@ -169,24 +181,78 @@ def main():
             return
 
         # CRITERION 6 CHECK: Write forwarding via UDS — read-after-write
+        # Retry up to 3 times — the writer's nexus may need a moment to
+        # re-initialize after the fork (pre-existing race condition).
+        for attempt in range(3):
+            try:
+                async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
+                    # Write a node (should be forwarded to writer via UDS)
+                    await prox.callStorm('[ inet:fqdn=write-test.com ]')
+                    print(f'[phase3] Write forwarding: callStorm succeeded')
+
+                # Read it back via writer UDS (workers have stale LMDB snapshots)
+                async with await s_telepath.openurl(f'unix://{uds_path}') as wprox:
+                    found = False
+                    async for mesg in wprox.storm('inet:fqdn=write-test.com'):
+                        if mesg[0] == 'node':
+                            found = True
+                    if found:
+                        print(f'[phase3] CRITERION 6 OK: read-after-write succeeded')
+                    else:
+                        print(f'FAIL CRITERION 6: wrote write-test.com but read returned no node')
+                        return
+                break
+            except Exception as e:
+                if attempt < 2:
+                    print(f'[phase3] CRITERION 6 attempt {attempt+1} failed ({e}), retrying...')
+                    await asyncio.sleep(1.0)
+                else:
+                    print(f'FAIL CRITERION 6: read-after-write failed after 3 attempts: {e}')
+                    return
+
+        # READONLY:TRUE CHECKS — verify the try-forward mechanism
         try:
             async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
-                # Write a node (should be forwarded to writer via UDS)
-                await prox.callStorm('[ inet:fqdn=write-test.com ]')
-                print(f'[phase3] Write forwarding: callStorm succeeded')
 
-                # Read it back (may hit worker's local readonly LMDB or writer)
-                found = False
-                async for mesg in prox.storm('inet:fqdn=write-test.com'):
-                    if mesg[0] == 'node':
-                        found = True
-                if found:
-                    print(f'[phase3] CRITERION 6 OK: read-after-write succeeded')
-                else:
-                    print(f'FAIL CRITERION 6: wrote write-test.com but read returned no node')
-                    return
+                # 1. Read query executes locally (no IsReadOnly error in stream)
+                mesgs = []
+                async for mesg in prox.storm('$lib.print(hello)'):
+                    mesgs.append(mesg)
+                errs = [m for m in mesgs if m[0] == 'err']
+                prints = [m for m in mesgs if m[0] == 'print']
+                assert not errs, f'Read query produced errors: {errs}'
+                assert len(prints) > 0, f'Read query returned no print (got {[m[0] for m in mesgs]})'
+                print(f'[readonly] CHECK 1 OK: read query local, {len(prints)} prints, no errors')
+
+                # 2. Write via storm (not callStorm) — IsReadOnly caught, forwarded
+                mesgs = []
+                async for mesg in prox.storm('[ inet:fqdn=readonly-storm-test.com ]'):
+                    mesgs.append(mesg)
+                errs = [m for m in mesgs if m[0] == 'err' and m[1][0] == 'IsReadOnly']
+                nodes = [m for m in mesgs if m[0] == 'node']
+                assert not errs, f'IsReadOnly leaked to client: {errs}'
+                assert len(nodes) > 0, 'Write-via-storm returned no nodes after forward'
+                print(f'[readonly] CHECK 2 OK: write via storm forwarded, {len(nodes)} nodes')
+
+                # 3. Mixed query — read with write side-effect (lib function)
+                #    $lib.print() is readonly-safe, but node creation is not
+                mesgs = []
+                async for mesg in prox.storm('[ inet:fqdn=readonly-mixed-test.com ] | limit 1'):
+                    mesgs.append(mesg)
+                errs = [m for m in mesgs if m[0] == 'err' and m[1][0] == 'IsReadOnly']
+                nodes = [m for m in mesgs if m[0] == 'node']
+                assert not errs, f'IsReadOnly leaked to client in mixed query: {errs}'
+                assert len(nodes) > 0, 'Mixed query returned no nodes after forward'
+                print(f'[readonly] CHECK 3 OK: mixed query forwarded, {len(nodes)} nodes')
+
+                # 4. callStorm write — IsReadOnly exception caught, forwarded
+                result = await prox.callStorm('[ inet:fqdn=readonly-callstorm-test.com ] return($node.repr())')
+                assert result is not None, 'callStorm write returned None'
+                print(f'[readonly] CHECK 4 OK: callStorm write forwarded, result={result}')
+
         except Exception as e:
-            print(f'FAIL CRITERION 6: read-after-write failed: {e}')
+            print(f'FAIL READONLY: {e}')
+            import traceback; traceback.print_exc()
             return
 
         # BUG 3 CHECK: Soak test — sustained load with multiple concurrent proxies

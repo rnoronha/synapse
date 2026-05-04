@@ -313,6 +313,16 @@ class ReadOnlyWorker:
         CoreApi.storm() calls self.cell.storm(), so patching the cell methods
         is the minimal interception point that works with the existing dmon
         pipeline.
+
+        Strategy: execute all queries with readonly=True in Storm opts.
+        Synapse's own runtime enforces readonly — if a write is attempted,
+        IsReadOnly surfaces as an ('err', ('IsReadOnly', ...)) message in
+        the storm stream (view.storm catches exceptions and converts them)
+        or as a Python exception in callStorm.  On detection, we forward
+        the query to the writer process via UDS.
+
+        The regex classify() is retained as an optional fast-path: queries
+        that are obviously writes skip the local readonly attempt entirely.
         '''
         cell = self._cell
         _orig_storm = cell.storm
@@ -320,26 +330,38 @@ class ReadOnlyWorker:
         worker = self
 
         async def _patched_storm(text, opts=None):
+            # Fast-path: skip readonly attempt for obvious writes
             if classify(text) == 'write':
                 async for mesg in worker._forward_storm(text, opts):
                     yield mesg
                 return
-            try:
-                async for mesg in _orig_storm(text, opts=opts):
-                    yield mesg
-            except s_exc.IsReadOnly:
-                async for mesg in worker._forward_storm(text, opts):
-                    yield mesg
+
+            # Try locally with readonly enforcement
+            ropts = dict(opts) if opts else {}
+            ropts['readonly'] = True
+
+            async for mesg in _orig_storm(text, opts=ropts):
+                if mesg[0] == 'err' and mesg[1][0] == 'IsReadOnly':
+                    # Write detected by Synapse runtime — forward to writer
+                    async for fmesg in worker._forward_storm(text, opts):
+                        yield fmesg
+                    return
+                yield mesg
 
         async def _patched_callStorm(text, opts=None):
+            # Fast-path: skip readonly attempt for obvious writes
             if classify(text) == 'write':
                 return await worker._forward_callStorm(text, opts)
+
+            # Try locally with readonly enforcement
+            ropts = dict(opts) if opts else {}
+            ropts['readonly'] = True
+
             try:
-                return await _orig_callStorm(text, opts=opts)
+                return await _orig_callStorm(text, opts=ropts)
             except s_exc.IsReadOnly:
                 return await worker._forward_callStorm(text, opts)
 
-        import types
         cell.storm = _patched_storm
         cell.callStorm = _patched_callStorm
 

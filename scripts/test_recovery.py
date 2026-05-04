@@ -29,7 +29,12 @@ def _handle_signal():
 
 
 def _get_cortex_pid(url):
-    """Resolve the cortex PID from a telepath URL's port via ss."""
+    """Resolve the parent cortex PID from a telepath URL's port via ss.
+
+    In fork mode, multiple processes share the port via EPOLLEXCLUSIVE.
+    We find all PIDs on the port, then return the one whose PPID is NOT
+    another cortex process (i.e. the parent/writer).
+    """
     match = re.search(r':(\d+)/', url)
     if not match:
         return None
@@ -39,27 +44,71 @@ def _get_cortex_pid(url):
             ['ss', '-tlnp', f'sport = :{port}'],
             text=True, stderr=subprocess.DEVNULL,
         )
+        pids = set()
         for line in out.splitlines():
             if 'LISTEN' not in line:
                 continue
-            m = re.search(r'pid=(\d+)', line)
-            if m:
-                return int(m.group(1))
+            for m in re.finditer(r'pid=(\d+)', line):
+                pids.add(int(m.group(1)))
+        if not pids:
+            return None
+        if len(pids) == 1:
+            return pids.pop()
+        # Multiple PIDs: the parent is the one whose PPID is not in the set
+        for pid in sorted(pids):
+            try:
+                stat = subprocess.check_output(
+                    ['ps', '-o', 'ppid=', '-p', str(pid)],
+                    text=True, stderr=subprocess.DEVNULL,
+                ).strip()
+                ppid = int(stat)
+                if ppid not in pids:
+                    return pid
+            except (subprocess.CalledProcessError, ValueError):
+                continue
+        # Fallback: return the lowest PID (likely the parent)
+        return min(pids)
     except (subprocess.CalledProcessError, ValueError):
         pass
     return None
 
 
 def _get_worker_pids(cortex_pid):
-    """Return list of worker child PIDs of the cortex process."""
+    """Return list of fork-mode worker child PIDs of the cortex process.
+
+    Only returns children that share the listening port (via ss), filtering
+    out non-worker children like axon/jsonstor subprocesses.
+    """
     try:
         out = subprocess.check_output(
             ['pgrep', '-P', str(cortex_pid)],
             text=True, stderr=subprocess.DEVNULL,
         )
-        return [int(p) for p in out.strip().split('\n') if p.strip()]
+        all_children = [int(p) for p in out.strip().split('\n') if p.strip()]
     except subprocess.CalledProcessError:
         return []
+
+    if not all_children:
+        return []
+
+    # Find PIDs that share the cortex listening port
+    try:
+        ss_out = subprocess.check_output(
+            ['ss', '-tlnp'], text=True, stderr=subprocess.DEVNULL,
+        )
+        port_pids = set()
+        for line in ss_out.splitlines():
+            if ':27492' not in line or 'LISTEN' not in line:
+                continue
+            for m in re.finditer(r'pid=(\d+)', line):
+                port_pids.add(int(m.group(1)))
+    except subprocess.CalledProcessError:
+        port_pids = set()
+
+    # Workers are children that share the listening port
+    workers = [p for p in all_children if p in port_pids]
+    # Fallback: if ss filtering found nothing, return all children
+    return workers if workers else all_children
 
 
 def _wait_pid_gone(pid, timeout=15):
