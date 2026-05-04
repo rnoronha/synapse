@@ -516,7 +516,7 @@ class Daemon(s_base.Base):
             # landed on a different fork worker), create one on-the-fly
             # using the shared item lookup — same as tele:syn would.
             if sess is None:
-                logger.warning('t2:init session miss (PATCHED-V2): sidn=%s name=%s, creating on-the-fly session', sidn, name)
+                logger.warning('t2:init session miss: sidn=%s name=%s, creating on-the-fly session', sidn, name)
                 item = await self._getSharedItem(name or '*')
                 if item is None:
                     raise s_exc.NoSuchObj(name=name)
@@ -530,11 +530,8 @@ class Daemon(s_base.Base):
                 link.onfini(sess.fini)
                 self.sessions[sess.iden] = sess
 
-                if isinstance(item, s_telepath.Aware):
-                    item = await s_coro.ornot(item.getTeleApi, link, mesg, ())
-                    if isinstance(item, s_base.Base):
-                        link.onfini(item)
-
+                # Store the shared item directly — pool connections were
+                # already authenticated on the original tele:syn link.
                 sess.setSessItem(name, item)
 
             else:
