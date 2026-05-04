@@ -10,6 +10,7 @@ on SIGTERM.
 import os
 import asyncio
 import signal
+import socket
 import logging
 import time
 
@@ -106,6 +107,8 @@ class Arbiter:
         self._shutdown_flag = False
         self._pending_restarts = []  # (slot_idx,) tuples queued by SIGCHLD handler
         self._loop = None  # set by install_loop_signal_handler
+        self._router_pid = None
+        self._control_channels = {}  # {worker_id: (router_fd, worker_fd)}
 
     def fork_workers(self, num_workers, listen_sock, uds_path, worker_main):
         '''
@@ -118,7 +121,7 @@ class Arbiter:
             num_workers: Number of worker processes to fork.
             listen_sock: The bound/listening socket fd workers inherit.
             uds_path: Filesystem path of the writer's UDS endpoint.
-            worker_main: Callable ``worker_main(listen_sock, uds_path, worker_id)``
+            worker_main: Callable ``worker_main(control_fd, uds_path, worker_id)``
                          invoked in each child.  Must not return (call ``os._exit``).
 
         Returns:
@@ -133,6 +136,14 @@ class Arbiter:
         _stop_memlock_threads()
         _close_all_slabs()
 
+        # Create per-worker UDS socketpairs for fd passing
+        for i in range(num_workers):
+            router_end, worker_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._control_channels[i] = (router_end.fileno(), worker_end.fileno())
+            # Detach so Python doesn't close them
+            router_end.detach()
+            worker_end.detach()
+
         self._install_parent_signals()
 
         for i in range(num_workers):
@@ -140,6 +151,45 @@ class Arbiter:
 
         logger.info('Forked %d workers: %s', num_workers, self._worker_pids)
         return list(self._worker_pids)
+
+    def fork_router(self, listen_fd):
+        '''Fork the router process. Must be called after fork_workers().
+
+        Args:
+            listen_fd: The listening socket fd the router will accept on.
+
+        Returns:
+            int: PID of the router process.
+        '''
+        import synapse.lib.router as s_router
+
+        # Build {worker_id: router_end_fd} map
+        worker_uds_fds = {}
+        for wid, (router_fd, worker_fd) in self._control_channels.items():
+            worker_uds_fds[wid] = router_fd
+
+        pid = os.fork()
+        if pid == 0:
+            # --- child (router) ---
+            try:
+                # Close worker-end fds in router process
+                for wid, (_, worker_fd) in self._control_channels.items():
+                    try:
+                        os.close(worker_fd)
+                    except OSError:
+                        pass
+
+                router = s_router.RouterProcess(listen_fd, worker_uds_fds)
+                router.router_main()
+            except Exception:
+                logger.exception('Router process crashed')
+            finally:
+                os._exit(0)
+
+        # --- parent (arbiter) ---
+        self._router_pid = pid
+        logger.info('Forked router (pid %d)', pid)
+        return pid
 
     # ------------------------------------------------------------------
     # internal fork helpers
@@ -171,7 +221,21 @@ class Arbiter:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-        self._worker_main(self._listen_sock, self._uds_path, worker_id)
+        # Close router-end fds and other workers' fds in this child
+        for wid, (router_fd, worker_fd) in self._control_channels.items():
+            try:
+                os.close(router_fd)
+            except OSError:
+                pass
+            if wid != worker_id:
+                try:
+                    os.close(worker_fd)
+                except OSError:
+                    pass
+
+        # Pass the worker's control channel fd instead of the listen fd
+        control_fd = self._control_channels[worker_id][1]
+        self._worker_main(control_fd, self._uds_path, worker_id)
 
     # ------------------------------------------------------------------
     # parent signal handlers
@@ -194,6 +258,16 @@ class Arbiter:
                 break
             if pid == 0:
                 break
+
+            if pid == self._router_pid:
+                if os.WIFSIGNALED(status):
+                    sig = os.WTERMSIG(status)
+                    logger.error('Router pid %d killed by signal %d', pid, sig)
+                else:
+                    code = os.WEXITSTATUS(status)
+                    logger.error('Router pid %d exited with code %d', pid, code)
+                self._router_pid = None
+                continue
 
             if pid in self._worker_pids:
                 idx = self._worker_pids.index(pid)
@@ -256,8 +330,20 @@ class Arbiter:
         logger.info('Respawned worker slot %d as pid %d', idx, pid)
 
     def shutdown(self):
-        '''Send SIGTERM to all workers, wait with timeout, SIGKILL stragglers.'''
+        '''Send SIGTERM to router first, then workers, wait with timeout, SIGKILL stragglers.'''
         self._shutdown_flag = True
+
+        # Phase 0: Stop the router first (no new connections)
+        if self._router_pid is not None:
+            try:
+                os.kill(self._router_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self._router_pid, 0)
+            except ChildProcessError:
+                pass
+            self._router_pid = None
 
         alive = [p for p in self._worker_pids if p is not None]
         if not alive:

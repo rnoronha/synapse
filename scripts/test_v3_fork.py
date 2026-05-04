@@ -101,13 +101,17 @@ def main():
     stderr_capture.truncate(0)
     stderr_capture.seek(0)
 
-    def _worker_entry(listen_sock, uds_path_arg, worker_id):
-        s_worker.worker_main(listen_sock, uds_path_arg, datadir, cell=cell)
+    def _worker_entry(control_fd, uds_path_arg, worker_id):
+        s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell)
 
     print(f'[phase2] Forking {NUM_WORKERS} workers...')
     arbiter = s_arbiter.Arbiter()
     pids = arbiter.fork_workers(NUM_WORKERS, listen_fd, uds_path, _worker_entry)
     print(f'[phase2] Worker PIDs: {pids}')
+
+    # Fork the router process after workers
+    router_pid = arbiter.fork_router(listen_fd)
+    print(f'[phase2] Router PID: {router_pid}')
 
     # BUG 1 CHECK: Assert workers survive the settle period (no SIGTERM)
     print(f'[check] Waiting {WORKER_SETTLE_TIME}s for workers to settle...')

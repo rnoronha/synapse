@@ -4706,11 +4706,14 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         # reference so nothing accidentally uses it between phases.
         cell.loop = None
 
-        def _worker_entry(listen_sock, uds_path_arg, worker_id):
-            s_worker.worker_main(listen_sock, uds_path_arg, datadir, cell=cell)
+        def _worker_entry(control_fd, uds_path_arg, worker_id):
+            s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell)
 
         arbiter = s_arbiter.Arbiter()
         arbiter.fork_workers(count, listen_fd, uds_path, _worker_entry)
+
+        # Fork the router process after workers (it needs worker UDS fds)
+        arbiter.fork_router(listen_fd)
 
         # Phase 3: Writer process creates a new event loop and serves
         async def _writer_serve():

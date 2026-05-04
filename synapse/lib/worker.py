@@ -119,12 +119,12 @@ class CircuitBreaker:
 # Worker entry point (called after fork)
 # ---------------------------------------------------------------------------
 
-def worker_main(listening_sock_fd, uds_path, datadir, cell=None):
+def worker_main(control_fd, uds_path, datadir, cell=None):
     '''
     Entry point for a forked read worker process.
 
     Args:
-        listening_sock_fd: File descriptor of the inherited listening socket.
+        control_fd: File descriptor of the UDS control channel from the router.
         uds_path: Path to the writer's UDS endpoint for write forwarding.
         datadir: Cortex data directory (for LMDB slab re-open).
         cell: The inherited Cortex cell object (shared via dmon for telepath).
@@ -151,7 +151,7 @@ def worker_main(listening_sock_fd, uds_path, datadir, cell=None):
                 obj.finievt = asyncio.Event()
         cell.loop = loop
 
-    worker = ReadOnlyWorker(listening_sock_fd, uds_path, cell=cell)
+    worker = ReadOnlyWorker(control_fd, uds_path, cell=cell)
     try:
         loop.run_until_complete(worker.serve())
     except KeyboardInterrupt:
@@ -209,13 +209,13 @@ def _reopen_lmdb_readonly(datadir):
 
 class ReadOnlyWorker:
     '''
-    Forked read worker. Accepts connections on the inherited listening socket
-    with EPOLLEXCLUSIVE, serves Storm reads locally, and forwards writes to
+    Forked read worker. Receives connection fds from the router via a UDS
+    control channel, serves Storm reads locally, and forwards writes to
     the writer via Telepath-over-UDS.
     '''
 
-    def __init__(self, listen_fd, uds_path, cell=None):
-        self._listen_fd = listen_fd
+    def __init__(self, control_fd, uds_path, cell=None):
+        self._control_fd = control_fd
         self._uds_path = uds_path
         self._cell = cell
         self._dmon = None
@@ -226,21 +226,15 @@ class ReadOnlyWorker:
         self._pid = os.getpid()
 
     async def serve(self):
-        '''Main worker loop. Registers listening socket with EPOLLEXCLUSIVE.'''
+        '''Main worker loop. Receives fds from router via recvmsg on control channel.'''
         self._write_sem = asyncio.Semaphore(5)
         loop = asyncio.get_running_loop()
 
-        # Patch the cell's storm/callStorm to intercept writes and forward
-        # them to the writer process via UDS.  This is the integration point:
-        # CoreApi.storm() → cell.storm() → our patched version.
         if self._cell is not None:
             self._install_write_forwarding()
 
-        # Create a Dmon to serve the telepath protocol on accepted connections
         if self._cell is not None:
             self._dmon = await s_daemon.Daemon.anit()
-            # Copy all share names from the parent's dmon so clients connecting
-            # with specific names (e.g. 'cortex') find the cell, not just '*'.
             parent_dmon = getattr(self._cell, 'dmon', None)
             if parent_dmon is not None:
                 for name, item in parent_dmon.shared.items():
@@ -248,54 +242,58 @@ class ReadOnlyWorker:
             else:
                 self._dmon.share('*', self._cell)
 
-        listen_sock = socket.socket(fileno=self._listen_fd)
-        listen_sock.setblocking(False)
+        control_sock = socket.socket(fileno=self._control_fd)
+        control_sock.setblocking(False)
 
-        # Register with EPOLLEXCLUSIVE to avoid thundering herd (3.12+)
-        epoll = select.epoll()
-        flags = select.EPOLLIN
-        if hasattr(select, 'EPOLLEXCLUSIVE'):
-            flags |= select.EPOLLEXCLUSIVE
-        epoll.register(self._listen_fd, flags)
+        # Send READY to the router
+        try:
+            control_sock.send(b'\x52')
+        except OSError:
+            logger.error('Worker %d: failed to send READY', self._pid)
 
-        logger.info('Worker %d: accepting connections', self._pid)
+        logger.info('Worker %d: receiving connections via control channel', self._pid)
 
         try:
             while not self._stopping:
                 if self._circuit.is_open:
-                    # Back off when writer is unreachable
                     await asyncio.sleep(self._circuit._recovery_timeout)
                     continue
 
-                try:
-                    events = await loop.run_in_executor(None, epoll.poll, 1.0)
-                except OSError:
+                # Wait for the control socket to be readable
+                readable = await loop.run_in_executor(None, self._poll_control, control_sock)
+                if not readable:
+                    continue
+
+                fd = await loop.run_in_executor(None, self._recv_fd, control_sock)
+                if fd is None:
+                    if self._stopping:
+                        break
+                    # Control channel closed — router died
+                    logger.warning('Worker %d: control channel closed', self._pid)
                     break
 
-                for fd, event in events:
-                    if fd == self._listen_fd and (event & select.EPOLLIN):
-                        await self._do_accept(listen_sock, loop)
+                conn = socket.socket(fileno=fd)
+                conn.setblocking(False)
+                loop.create_task(self._handle_connection(conn, conn.getpeername()))
         finally:
-            epoll.unregister(self._listen_fd)
-            epoll.close()
-            # Don't close the socket — fd is shared with parent
-            listen_sock.detach()
+            control_sock.detach()
             if self._dmon is not None:
                 await self._dmon.fini()
             await self._close_writer_proxy()
             logger.info('Worker %d: stopped', self._pid)
 
-    async def _do_accept(self, listen_sock, loop):
-        '''Accept one connection and spawn a handler task.'''
+    def _poll_control(self, control_sock):
+        '''Poll the control socket for readability (blocking, run in executor).'''
         try:
-            conn, addr = listen_sock.accept()
-            conn.setblocking(False)
-        except BlockingIOError:
-            return
-        except OSError:
-            return
+            r, _, _ = select.select([control_sock], [], [], 1.0)
+            return bool(r)
+        except (OSError, ValueError):
+            return False
 
-        loop.create_task(self._handle_connection(conn, addr))
+    def _recv_fd(self, control_sock):
+        '''Receive a file descriptor from the control channel.'''
+        from synapse.lib.router import recv_fd
+        return recv_fd(control_sock)
 
     async def _handle_connection(self, conn, addr):
         '''Handle a single client connection via the telepath dmon protocol.'''
