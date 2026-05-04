@@ -178,9 +178,17 @@ class WriteChannelListener:
             self._send(fd, ('err', req_id, excinfo))
 
     def _send(self, fd, msg):
-        '''Send a msgpack-encoded message on the given fd.'''
+        '''Send a msgpack-encoded message on the given fd.
+
+        Handles partial writes on SOCK_STREAM socketpairs by looping
+        until all bytes are sent.
+        '''
         data = s_msgpack.en(msg)
-        try:
-            os.write(fd, data)
-        except OSError as e:
-            logger.warning('Write channel send failed on fd %d: %s', fd, e)
+        mv = memoryview(data)
+        while mv:
+            try:
+                sent = os.write(fd, mv)
+            except OSError as e:
+                logger.warning('Write channel send failed on fd %d: %s', fd, e)
+                return
+            mv = mv[sent:]

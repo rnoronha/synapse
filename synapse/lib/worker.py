@@ -312,14 +312,22 @@ class ReadOnlyWorker:
         if not self._write_alive:
             raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
 
+        data = s_msgpack.en(req)
         loop = asyncio.get_running_loop()
         try:
             await asyncio.wait_for(
-                loop.run_in_executor(None, os.write, self._write_fd, s_msgpack.en(req)),
+                loop.run_in_executor(None, self._sendall, data),
                 timeout=30.0)
         except (OSError, BrokenPipeError, asyncio.TimeoutError):
             self._write_alive = False
             raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
+
+    def _sendall(self, data):
+        '''Write all bytes to the write channel fd, handling partial writes.'''
+        mv = memoryview(data)
+        while mv:
+            sent = os.write(self._write_fd, mv)
+            mv = mv[sent:]
 
     async def _recv_write_resp(self, unpacker):
         '''Read one chunk from the write channel into the unpacker.'''
