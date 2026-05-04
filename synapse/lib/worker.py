@@ -185,6 +185,7 @@ class ReadOnlyWorker:
         self._pid = os.getpid()
         # Demux state: single reader task dispatches to per-request queues
         self._write_lock = None       # asyncio.Lock for serializing sends
+        self._write_ready = None      # asyncio.Event set when writer is ready
         self._pending_reqs = {}       # {req_id: asyncio.Queue}
         self._reader_task = None
 
@@ -282,6 +283,7 @@ class ReadOnlyWorker:
 
         # Start the demux reader and init the send lock
         self._write_lock = asyncio.Lock()
+        self._write_ready = asyncio.Event()
         if self._write_fd is not None:
             self._reader_task = asyncio.get_running_loop().create_task(self._demux_reader())
 
@@ -319,6 +321,27 @@ class ReadOnlyWorker:
     async def _demux_reader(self):
         '''Background task: read from write_fd and dispatch to per-request queues.'''
         loop = asyncio.get_running_loop()
+
+        # Wait for the writer's ready byte before processing responses.
+        # The WriteChannelListener sends 0x01 on each writer-end fd once
+        # its epoll loop is registered and ready to receive requests.
+        try:
+            ready_byte = await asyncio.wait_for(
+                loop.run_in_executor(None, os.read, self._write_fd, 1),
+                timeout=60.0)
+            if not ready_byte:
+                logger.error('Worker %d: write channel closed before ready', self._pid)
+                self._write_alive = False
+                return
+            logger.info('Worker %d: write channel ready', self._pid)
+        except (OSError, asyncio.TimeoutError) as e:
+            logger.error('Worker %d: write channel ready wait failed: %s', self._pid, e)
+            self._write_alive = False
+            return
+
+        # Signal that writes can now be forwarded
+        self._write_ready.set()
+
         unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
         while self._write_alive:
             try:
@@ -340,6 +363,13 @@ class ReadOnlyWorker:
 
     async def _send_write_rpc(self, req):
         '''Send a write RPC request, serialized via lock.'''
+        # Wait for the writer to signal readiness (ready byte received)
+        if self._write_ready is not None and not self._write_ready.is_set():
+            try:
+                await asyncio.wait_for(self._write_ready.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                raise s_exc.SynErr(mesg='Writer unavailable (write channel not ready)')
+
         if not self._write_alive:
             raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
 

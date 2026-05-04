@@ -40,12 +40,19 @@ class WriteChannelListener:
         self._writer_fds = list(writer_fds)
         self._running = False
         self._task = None
+        self._ready = asyncio.Event()
 
     async def start(self):
-        '''Start the write channel listener as a background task.'''
+        '''Start the write channel listener and wait until it is polling.
+
+        Returns only after the epoll loop has entered its first poll(),
+        ensuring that any writes already buffered in the socketpairs will
+        be picked up.
+        '''
         self._running = True
         self._task = asyncio.get_running_loop().create_task(self._listen())
-        logger.info('Write channel listener started with %d worker fds', len(self._writer_fds))
+        await self._ready.wait()
+        logger.info('Write channel listener ready with %d worker fds', len(self._writer_fds))
 
     async def stop(self):
         '''Stop the listener and close all writer-end fds.'''
@@ -74,6 +81,17 @@ class WriteChannelListener:
         for fd in self._writer_fds:
             ep.register(fd, select.EPOLLIN)
             unpackers[fd] = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+
+        # Signal readiness: send a single byte on each writer-end fd so
+        # workers know the write channel is ready to receive requests.
+        for fd in self._writer_fds:
+            try:
+                os.write(fd, b'\x01')
+            except OSError as e:
+                logger.warning('Failed to send ready byte on fd %d: %s', fd, e)
+
+        # Signal internal ready event
+        self._ready.set()
 
         try:
             while self._running:
@@ -148,8 +166,10 @@ class WriteChannelListener:
             return
 
         try:
+            count = 0
             async for mesg in self._cell.storm(text, opts=opts):
                 self._send(fd, ('msg', req_id, mesg))
+                count += 1
             self._send(fd, ('done', req_id))
         except Exception as e:
             excinfo = {

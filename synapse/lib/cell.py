@@ -4722,19 +4722,76 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             # The init loop is dead; every Base created during init has a
             # stale loop reference.
             import gc
+            import threading
+            import synapse.glob as s_glob
             new_loop = asyncio.get_running_loop()
+
+            # Reset the global loop reference so s_glob.iAmLoop() and
+            # s_glob.initloop() return the correct (new) loop.
+            s_glob._glob_loop = new_loop
+            s_glob._glob_thrd = threading.current_thread()
+
+            fini_count = 0
             for obj in gc.get_objects():
                 if isinstance(obj, s_base.Base) and obj.anitted:
+                    if obj.isfini:
+                        fini_count += 1
                     obj.loop = new_loop
+                    obj.isfini = False
                     obj.finievt = asyncio.Event()
             cell.loop = new_loop
+            if fini_count:
+                logger.warning('E-1 fix: Reset isfini on %d Base objects', fini_count)
 
             # E-2 fix: Decrement the extra ref we added in _initForFork
             # to prevent fini during asyncio.run() teardown.
             cell._syn_refs -= 1
 
+            # Verify nexsroot state
+            if hasattr(cell, 'nexsroot') and cell.nexsroot is not None:
+                logger.info('Writer: nexsroot.isfini=%s nexsroot.readonly=%s',
+                           cell.nexsroot.isfini, cell.nexsroot.readonly)
+
             # E-3 fix: Re-open LMDB slabs closed before fork.
             s_arbiter._reopen_writer_slabs()
+
+            # E-4 fix: Re-open nexus log tail slab if it was fini'd during
+            # init loop teardown. The MultiSlabSeqn's tail slab may have been
+            # removed from allslabs if asyncio.run() teardown cancelled tasks
+            # that triggered its fini.
+            if hasattr(cell, 'nexsroot') and cell.nexsroot is not None:
+                nexslog = cell.nexsroot.nexslog
+                if nexslog is not None and nexslog.tailslab is not None:
+                    tailslab = nexslog.tailslab
+                    if tailslab.isfini or str(tailslab.path) not in s_lmdbslab.Slab.allslabs:
+                        import lmdb as _lmdb
+                        path = tailslab.path
+                        tailslab.isfini = False
+                        tailslab.lenv = _lmdb.open(str(path),
+                            map_size=tailslab.mapsize, max_dbs=128, max_readers=256,
+                            writemap=True, readonly=False, readahead=tailslab.readahead,
+                            map_async=True)
+                        tailslab._initCoXact()
+                        old_dbnames = dict(tailslab.dbnames)
+                        tailslab.dbnames = {None: (None, False)}
+                        for name, (db, dupsort) in old_dbnames.items():
+                            if name is None:
+                                continue
+                            try:
+                                newdb = tailslab.lenv.open_db(name.encode('utf8'), txn=tailslab.xact, dupsort=dupsort)
+                                tailslab.dbnames[name] = (newdb, dupsort)
+                            except Exception:
+                                pass
+                        tailslab.dirty = True
+                        tailslab.forcecommit()
+                        s_lmdbslab.Slab.allslabs[str(path)] = tailslab
+                        logger.info('E-4: Re-opened nexus log tail slab: %s', path)
+
+            # Verify all writable slabs have valid transactions
+            for slab in list(s_lmdbslab.Slab.allslabs.values()):
+                if not slab.readonly and slab.xact is None:
+                    logger.warning('Slab %s had xact=None after reopen, re-initializing', slab.path)
+                    slab._initCoXact()
 
             # S-1 fix: Replace the raw signal.signal SIGCHLD handler with
             # a loop-based handler so restarts happen from the event loop,
