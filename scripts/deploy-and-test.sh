@@ -176,7 +176,7 @@ if [[ -z "$ARTIFACT" ]]; then
     esac
     # Find the latest artifact matching the prefix
     ARTIFACT=$(aws s3 ls "s3://$S3_BUCKET/" --region "$REGION" 2>/dev/null \
-        | grep "$ARTIFACT_PREFIX" | sort -k1,2 | tail -1 | awk "{print \$4}")
+        | grep "$ARTIFACT_PREFIX" | sort -k1,2 | tail -1 | awk "{print \$4}" || true)
     if [[ -n "$ARTIFACT" ]]; then
         ARTIFACT="s3://$S3_BUCKET/$ARTIFACT"
         echo "Auto-resolved artifact: $ARTIFACT"
