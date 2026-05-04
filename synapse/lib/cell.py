@@ -4685,6 +4685,12 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             # The cell is already initialized; just need to serve.
             # Re-create listeners and active coros in a new event loop.
             async def _fallback_serve():
+                # Same fixes as _writer_serve: rebind to new loop
+                cell.loop = asyncio.get_running_loop()
+                cell.isfini = False
+                cell.finievt = asyncio.Event()
+                cell.dmon.isfini = False
+                cell.dmon.finievt = asyncio.Event()
                 await cell._restoreAfterInitLoop()
                 await cell.main()
             asyncio.run(_fallback_serve())
@@ -4701,7 +4707,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         cell.loop = None
 
         def _worker_entry(listen_sock, uds_path_arg, worker_id):
-            s_worker.worker_main(listen_sock, uds_path_arg, datadir)
+            s_worker.worker_main(listen_sock, uds_path_arg, datadir, cell=cell)
 
         arbiter = s_arbiter.Arbiter()
         arbiter.fork_workers(count, listen_fd, uds_path, _worker_entry)
@@ -4709,8 +4715,24 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         # Phase 3: Writer process creates a new event loop and serves
         async def _writer_serve():
 
-            # E-1 fix: Rebind the cell to the new running event loop.
-            cell.loop = asyncio.get_running_loop()
+            # E-1 fix: Rebind ALL Base objects to the new event loop.
+            # The init loop is dead; every Base created during init has a
+            # stale loop reference.
+            import gc
+            new_loop = asyncio.get_running_loop()
+            for obj in gc.get_objects():
+                if isinstance(obj, s_base.Base) and obj.anitted:
+                    obj.loop = new_loop
+                    # Recreate finievt bound to the new loop
+                    obj.finievt = asyncio.Event()
+            cell.loop = new_loop
+
+            # E-2 fix: Decrement the extra ref we added in _initForFork
+            # to prevent fini during asyncio.run() teardown.
+            cell._syn_refs -= 1
+
+            # E-3 fix: Re-open LMDB slabs closed before fork.
+            s_arbiter._reopen_writer_slabs()
 
             # S-1 fix: Replace the raw signal.signal SIGCHLD handler with
             # a loop-based handler so restarts happen from the event loop,
@@ -4749,12 +4771,31 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
     def _mayFork(cls, argv):
         '''Quick check whether this cell class might use fork mode.
 
-        Returns True if the subclass overrides prepareFork (e.g. Cortex).
-        The actual decision happens in prepareFork() at runtime.
+        Returns True only if the cell config has multi:process:readers > 0.
+        This avoids the two-phase init (which breaks the forkserver pool)
+        when fork mode isn't actually needed.
         '''
-        # Cell.prepareFork doesn't exist — only subclasses that support
-        # fork mode define it.
-        return hasattr(cls, 'prepareFork')
+        if not hasattr(cls, 'prepareFork'):
+            return False
+
+        # Probe the cell.yaml in the data directory (first positional arg)
+        # to check if multi:process:readers is configured.
+        import yaml
+        dirn = None
+        for arg in argv:
+            if not arg.startswith('-'):
+                dirn = arg
+                break
+        if dirn is None:
+            return False
+
+        cellpath = os.path.join(dirn, 'cell.yaml')
+        try:
+            with open(cellpath) as f:
+                conf = yaml.safe_load(f) or {}
+            return conf.get('multi:process:readers', 0) > 0
+        except (OSError, yaml.YAMLError):
+            return False
 
     @classmethod
     async def _initForFork(cls, argv, outp=None):
@@ -4779,6 +4820,12 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             # When asyncio.run() returns, the loop closes and asyncio servers
             # are cleaned up, but the dup'd fd keeps the OS socket alive.
             fork_info['listen_fd'] = os.dup(fork_info['listen_fd'])
+
+        # Prevent the cell (and its children) from being fini'd during
+        # asyncio.run() teardown.  The teardown cancels tasks which may
+        # cascade to fini() calls.  By holding an extra ref, fini() is
+        # a no-op (refs > 0) and isfini stays False.
+        cell._syn_refs += 1
 
         return {'cell': cell, 'fork_info': fork_info}
 

@@ -8,6 +8,7 @@ crashed workers via SIGCHLD and respawns them, and performs orderly shutdown
 on SIGTERM.
 '''
 import os
+import asyncio
 import signal
 import logging
 import time
@@ -131,9 +132,12 @@ class Arbiter:
         pid = os.fork()
         if pid == 0:
             # --- child ---
-            self._in_child(worker_id)
-            # worker_main must not return; belt-and-suspenders:
-            os._exit(1)
+            try:
+                self._in_child(worker_id)
+            except Exception:
+                logger.exception('Worker %d crashed during init', os.getpid())
+            finally:
+                os._exit(1)
 
         # --- parent ---
         self._worker_pids.append(pid)
@@ -222,8 +226,12 @@ class Arbiter:
 
         pid = os.fork()
         if pid == 0:
-            self._in_child(idx)
-            os._exit(1)
+            try:
+                self._in_child(idx)
+            except Exception:
+                logger.exception('Worker %d crashed during init', os.getpid())
+            finally:
+                os._exit(1)
 
         self._worker_pids[idx] = pid
         logger.info('Respawned worker slot %d as pid %d', idx, pid)
@@ -271,3 +279,57 @@ class Arbiter:
             except (ProcessLookupError, ChildProcessError):
                 pass
             self._worker_pids[i] = None
+
+
+def _reopen_writer_slabs():
+    '''Re-open LMDB environments in the writer process after fork.
+
+    _close_all_slabs() closed all lenv handles before fork.  The writer
+    needs them back in read-write mode.  Also resets isfini on slabs that
+    were marked fini by _stop_memlock_threads(), and re-opens all cached
+    database handles against the new environment.
+    '''
+    import lmdb as _lmdb
+    for slab in list(s_lmdbslab.Slab.allslabs.values()):
+        path = slab.path
+        opts = {
+            'map_size': slab.mapsize,
+            'max_dbs': 128,
+            'max_readers': 256,
+            'writemap': True,
+            'readonly': slab.readonly,
+            'readahead': slab.readahead,
+            'map_async': True,
+        }
+        try:
+            slab.lenv = _lmdb.open(str(path), **opts)
+            slab.isfini = False
+            # Recreate asyncio events bound to the new loop
+            slab.lockdoneevent = asyncio.Event()
+            slab.lockdoneevent.set()  # no memlock in writer after fork
+
+            if not slab.readonly:
+                slab._initCoXact()
+
+            # Re-open all cached database handles against the new env
+            old_dbnames = dict(slab.dbnames)
+            slab.dbnames = {None: (None, False)}
+            for name, (db, dupsort) in old_dbnames.items():
+                if name is None:
+                    continue
+                try:
+                    if slab.readonly:
+                        newdb = slab.lenv.open_db(name.encode('utf8'), create=False, dupsort=dupsort)
+                    else:
+                        newdb = slab.lenv.open_db(name.encode('utf8'), txn=slab.xact, dupsort=dupsort)
+                    slab.dbnames[name] = (newdb, dupsort)
+                except Exception:
+                    logger.warning('Failed to re-open db %s in slab %s', name, path)
+
+            if not slab.readonly:
+                slab.dirty = True
+                slab.forcecommit()
+
+            logger.debug('Re-opened slab %s for writer (%d dbs)', path, len(slab.dbnames) - 1)
+        except Exception:
+            logger.exception('Failed to re-open slab %s for writer', path)

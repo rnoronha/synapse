@@ -247,8 +247,9 @@ if [[ -n "$DATA_SNAPSHOT" ]]; then
         --instance-id "$INSTANCE_ID" \
         --device /dev/xvdf --output text >/dev/null
 
-    sleep 10
-    run_ssm "sudo mkdir -p $DATADIR && sudo mount /dev/xvdf $DATADIR && sudo chown ec2-user:ec2-user $DATADIR"
+    sleep 15
+    # On Nitro instances (c5, m5, etc.), EBS volumes appear as NVMe devices
+    run_ssm "sudo mkdir -p $DATADIR && for i in \$(seq 1 30); do if [ -b /dev/nvme1n1 ]; then DEV=/dev/nvme1n1; break; elif [ -b /dev/xvdf ]; then DEV=/dev/xvdf; break; fi; sleep 2; done; echo Using_device=\$DEV; sudo mount \$DEV $DATADIR && sudo chown ec2-user:ec2-user $DATADIR"
     echo "Snapshot data mounted at $DATADIR"
 fi
 
@@ -343,21 +344,39 @@ echo "Starting cortex..."
 run_ssm "nohup setsid python3.11 -m synapse.servers.cortex $DATADIR --telepath tcp://0.0.0.0:27492/ --https 0 </dev/null >/tmp/cortex.log 2>&1 & sleep 2"
 
 # Health check: wait for expected ports
+# Fork mode (phase2): workers share the writer's port via EPOLLEXCLUSIVE.
+# Only 1 TCP port is expected. Verify workers via process count.
 if [[ "$READERS" -eq 0 ]]; then
     EXPECTED_PORTS=1
+    EXPECTED_PROCS=1
 else
-    EXPECTED_PORTS=3
+    EXPECTED_PORTS=1
+    # Workers = ceil(cpu_count * readers_pct / 100), minimum 1
+    CPU_COUNT=$(run_ssm "nproc" | tr -d '[:space:]')
+    EXPECTED_PROCS=$(( (CPU_COUNT * READERS / 100) + 1 ))  # +1 for writer
+    if [[ $EXPECTED_PROCS -lt 2 ]]; then
+        EXPECTED_PROCS=2
+    fi
 fi
 
-echo "Waiting for $EXPECTED_PORTS port(s) (max 120s)..."
+PROC_COUNT=0
+echo "Waiting for $EXPECTED_PORTS port(s) and $EXPECTED_PROCS process(es) (max 120s)..."
 for i in $(seq 1 24); do
     PORT_COUNT=$(run_ssm "ss -tlnp | grep -c '2749[0-9]' || echo 0" | tr -d '[:space:]')
     if [[ "$PORT_COUNT" -ge "$EXPECTED_PORTS" ]]; then
-        echo "Cortex ready ($PORT_COUNT ports listening)."
-        break
+        if [[ "$READERS" -eq 0 ]]; then
+            echo "Cortex ready ($PORT_COUNT ports listening)."
+            break
+        fi
+        # For fork mode, also check worker process count
+        PROC_COUNT=$(run_ssm "pgrep -f 'synapse.servers.cortex' | wc -l" | tr -d '[:space:]')
+        if [[ "$PROC_COUNT" -ge "$EXPECTED_PROCS" ]]; then
+            echo "Cortex ready ($PORT_COUNT ports, $PROC_COUNT processes)."
+            break
+        fi
     fi
     if [[ $i -eq 24 ]]; then
-        echo "ERROR: Only $PORT_COUNT/$EXPECTED_PORTS ports after 120s"
+        echo "ERROR: Only $PORT_COUNT/$EXPECTED_PORTS ports, $PROC_COUNT/$EXPECTED_PROCS procs after 120s"
         echo "Cortex log:"
         run_ssm "tail -50 /tmp/cortex.log" || true
         exit 1

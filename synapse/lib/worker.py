@@ -17,7 +17,9 @@ import logging
 import lmdb
 
 import synapse.exc as s_exc
+import synapse.daemon as s_daemon
 import synapse.telepath as s_telepath
+import synapse.lib.link as s_link
 import synapse.lib.lmdbslab as s_lmdbslab
 
 logger = logging.getLogger(__name__)
@@ -117,7 +119,7 @@ class CircuitBreaker:
 # Worker entry point (called after fork)
 # ---------------------------------------------------------------------------
 
-def worker_main(listening_sock_fd, uds_path, datadir):
+def worker_main(listening_sock_fd, uds_path, datadir, cell=None):
     '''
     Entry point for a forked read worker process.
 
@@ -125,13 +127,20 @@ def worker_main(listening_sock_fd, uds_path, datadir):
         listening_sock_fd: File descriptor of the inherited listening socket.
         uds_path: Path to the writer's UDS endpoint for write forwarding.
         datadir: Cortex data directory (for LMDB slab re-open).
+        cell: The inherited Cortex cell object (shared via dmon for telepath).
     '''
+    # Neutralize the inherited forkpool (stale threads/pipes after fork)
+    import synapse.lib.processpool as s_processpool
+    if getattr(s_processpool, 'forkpool', None) is not None:
+        s_processpool.forkpool.shutdown(wait=False)
+        s_processpool.forkpool = None
+
     _reopen_lmdb_readonly(datadir)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    worker = ReadOnlyWorker(listening_sock_fd, uds_path)
+    worker = ReadOnlyWorker(listening_sock_fd, uds_path, cell=cell)
     try:
         loop.run_until_complete(worker.serve())
     except KeyboardInterrupt:
@@ -180,9 +189,11 @@ class ReadOnlyWorker:
     the writer via Telepath-over-UDS.
     '''
 
-    def __init__(self, listen_fd, uds_path):
+    def __init__(self, listen_fd, uds_path, cell=None):
         self._listen_fd = listen_fd
         self._uds_path = uds_path
+        self._cell = cell
+        self._dmon = None
         self._writer_proxy = None
         self._circuit = CircuitBreaker(threshold=3, recovery_timeout=1.0)
         self._write_sem = None  # created in serve() inside the event loop
@@ -193,6 +204,11 @@ class ReadOnlyWorker:
         '''Main worker loop. Registers listening socket with EPOLLEXCLUSIVE.'''
         self._write_sem = asyncio.Semaphore(5)
         loop = asyncio.get_running_loop()
+
+        # Create a Dmon to serve the telepath protocol on accepted connections
+        if self._cell is not None:
+            self._dmon = await s_daemon.Daemon.anit()
+            self._dmon.share('*', self._cell)
 
         listen_sock = socket.socket(fileno=self._listen_fd)
         listen_sock.setblocking(False)
@@ -223,6 +239,8 @@ class ReadOnlyWorker:
             epoll.close()
             # Don't close the socket — fd is shared with parent
             listen_sock.detach()
+            if self._dmon is not None:
+                await self._dmon.fini()
             await self._close_writer_proxy()
             logger.info('Worker %d: stopped', self._pid)
 
@@ -239,27 +257,14 @@ class ReadOnlyWorker:
         loop.create_task(self._handle_connection(conn, addr))
 
     async def _handle_connection(self, conn, addr):
-        '''Handle a single client connection: classify and route queries.'''
-        loop = asyncio.get_running_loop()
+        '''Handle a single client connection via the telepath dmon protocol.'''
+        if self._dmon is None:
+            conn.close()
+            return
+
         reader, writer = await asyncio.open_connection(sock=conn)
-        try:
-            # The connection is a Telepath link. We read Storm requests
-            # from the Telepath protocol and route them.
-            # For Phase 1b, we use a simplified protocol: the worker acts
-            # as a Telepath-aware proxy. Full dmon integration comes in Phase 2.
-            #
-            # For now, each accepted connection is handed to the Daemon
-            # infrastructure that the Cortex already uses. The worker's
-            # storm() method overrides the Cortex's to classify and route.
-            pass
-        except Exception:
-            logger.exception('Worker %d: connection handler error', self._pid)
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
+        link = await s_link.Link.anit(reader, writer)
+        link.schedCoro(self._dmon._onLinkInit(link))
 
     async def storm(self, text, opts=None):
         '''
