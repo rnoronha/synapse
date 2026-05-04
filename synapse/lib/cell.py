@@ -4762,6 +4762,13 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             # Re-create the UDS listener for write forwarding
             await cell.dmon.listen(f'unix://{uds_path}')
 
+            # Start the write channel listener for direct worker→writer RPC
+            writer_fds = arbiter.get_writer_fds()
+            if writer_fds:
+                import synapse.lib.writechannel as s_writechannel
+                wc_listener = s_writechannel.WriteChannelListener(cell, writer_fds)
+                await wc_listener.start()
+
             # Re-fire active coros that were cancelled when the init loop closed
             cell._fireActiveCoros()
             await cell.main()
