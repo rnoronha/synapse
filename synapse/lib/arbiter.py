@@ -162,6 +162,8 @@ class Arbiter:
 
     def _in_child(self, worker_id):
         '''Run in the child process immediately after fork.'''
+        # Create a new session so SSM process group cleanup cannot reach us.
+        os.setsid()
         # Reset inherited parent signal handlers.
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
