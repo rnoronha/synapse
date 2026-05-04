@@ -208,7 +208,14 @@ class ReadOnlyWorker:
         # Create a Dmon to serve the telepath protocol on accepted connections
         if self._cell is not None:
             self._dmon = await s_daemon.Daemon.anit()
-            self._dmon.share('*', self._cell)
+            # Copy all share names from the parent's dmon so clients connecting
+            # with specific names (e.g. 'cortex') find the cell, not just '*'.
+            parent_dmon = getattr(self._cell, 'dmon', None)
+            if parent_dmon is not None:
+                for name, item in parent_dmon.shared.items():
+                    self._dmon.share(name, self._cell)
+            else:
+                self._dmon.share('*', self._cell)
 
         listen_sock = socket.socket(fileno=self._listen_fd)
         listen_sock.setblocking(False)

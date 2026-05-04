@@ -1,26 +1,28 @@
 #!/usr/bin/env python3.11
 '''
-Reproduce and verify the v3 fork worker bug.
+Reproduce and verify v3 fork bugs:
 
-Root cause: worker.py used select.EPOLLEXCLUSIVE unconditionally,
-which doesn't exist in Python < 3.12. Workers crashed immediately
-after fork with AttributeError. The "Caught SIGTERM" messages in
-EC2 logs were from forkserver pool processes during Phase 1 teardown,
-not from the forked workers — a red herring.
+BUG 1: Forkserver pool workers (SpawnProcess-1/2/3) get SIGTERM during startup.
+  Root cause: forkpool not shut down before os.fork() in arbiter.
+  Fix: _shutdown_forkpool() called pre-fork in arbiter.fork_workers().
 
-Fix: graceful degradation to plain EPOLLIN when EPOLLEXCLUSIVE is
-unavailable.
+BUG 2: NoSuchObj: name=None — workers accept connections but cortex share
+  isn't registered under the right names.
+  Root cause: worker dmon only shared '*', not 'cortex' or other names.
+  Fix: worker copies all parent dmon share names to its own dmon.
 
-This test replicates the exact fork sequence from cell.py _runForkMode:
+This test replicates the exact fork sequence from cell.py startmain:
   Phase 1: asyncio.run(init) — init Cortex, loop closes on return
   Phase 2: os.fork() × N — fork read workers
   Phase 3: asyncio.run(serve) — writer event loop
 '''
+import io
 import os
 import sys
 import time
 import signal
 import asyncio
+import logging
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +38,12 @@ WORKER_SETTLE_TIME = 3.0
 
 
 def main():
+    # Capture stderr to detect SIGTERM messages (BUG 1 evidence)
+    stderr_capture = io.StringIO()
+    log_handler = logging.StreamHandler(stderr_capture)
+    log_handler.setLevel(logging.DEBUG)
+    logging.getLogger().addHandler(log_handler)
+
     td = tempfile.mkdtemp(prefix='v3fork-')
     print(f'[parent pid={os.getpid()}] tempdir: {td}')
 
@@ -73,6 +81,12 @@ def main():
     print(f'[phase1] Done. port={port} isfini={cell.isfini} refs={cell._syn_refs}')
 
     # Phase 2: Fork workers (mirrors _runForkMode)
+    # Reset log capture AFTER phase 1 — the init loop teardown legitimately
+    # kills forkserver pool workers (SpawnProcess-*). We only care about
+    # SIGTERM happening AFTER fork.
+    stderr_capture.truncate(0)
+    stderr_capture.seek(0)
+
     def _worker_entry(listen_sock, uds_path_arg, worker_id):
         s_worker.worker_main(listen_sock, uds_path_arg, datadir, cell=cell)
 
@@ -81,8 +95,8 @@ def main():
     pids = arbiter.fork_workers(NUM_WORKERS, listen_fd, uds_path, _worker_entry)
     print(f'[phase2] Worker PIDs: {pids}')
 
-    # Assert workers survive the settle period
-    print(f'[check] Waiting {WORKER_SETTLE_TIME}s...')
+    # BUG 1 CHECK: Assert workers survive the settle period (no SIGTERM)
+    print(f'[check] Waiting {WORKER_SETTLE_TIME}s for workers to settle...')
     time.sleep(WORKER_SETTLE_TIME)
 
     dead = []
@@ -93,7 +107,7 @@ def main():
             dead.append(pid)
 
     if dead:
-        print(f'FAIL: {len(dead)} worker(s) died within {WORKER_SETTLE_TIME}s')
+        print(f'FAIL BUG 1: {len(dead)} worker(s) died within {WORKER_SETTLE_TIME}s (SIGTERM during startup)')
         for pid in dead:
             try:
                 rpid, status = os.waitpid(pid, os.WNOHANG)
@@ -106,9 +120,16 @@ def main():
                 print(f'  pid {pid}: already reaped')
         os._exit(1)
 
-    print(f'[check] All {NUM_WORKERS} workers alive')
+    print(f'[check] BUG 1 OK: All {NUM_WORKERS} workers alive (no SIGTERM)')
 
-    # Phase 3: Writer serves, verify telepath (mirrors _writer_serve)
+    # Check captured logs for SIGTERM evidence
+    captured = stderr_capture.getvalue()
+    if 'SIGTERM' in captured or 'SpawnProcess' in captured:
+        print(f'FAIL BUG 1: SIGTERM or SpawnProcess found in logs')
+        print(captured[:500])
+        os._exit(1)
+
+    # Phase 3: Writer serves, verify telepath (BUG 2 check)
     test_ok = False
 
     async def writer_serve():
@@ -138,11 +159,18 @@ def main():
         await cell._restoreDmonListener(listen_fd)
         await cell.dmon.listen(f'unix://{uds_path}')
 
-        # Verify telepath
-        async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
-            info = await prox.getCellInfo()
-            assert info is not None, 'getCellInfo returned None'
-            print(f'[phase3] Telepath OK')
+        # BUG 2 CHECK: Verify telepath query with specific name 'cortex'
+        # This is the exact pattern that triggers NoSuchObj: name=None
+        try:
+            async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}/cortex') as prox:
+                info = await prox.getCellInfo()
+                assert info is not None, 'getCellInfo returned None'
+                ctype = info.get('cell', {}).get('type', '')
+                assert ctype == 'cortex', f'Expected cortex, got {ctype}'
+                print(f'[phase3] BUG 2 OK: Telepath /cortex query succeeded (type={ctype})')
+        except Exception as e:
+            print(f'FAIL BUG 2: Telepath /cortex query failed: {e}')
+            return
 
         # Verify workers still alive after serving
         for pid in pids:
@@ -168,10 +196,10 @@ def main():
                 pass
 
     if test_ok:
-        print('\nPASS: Workers survived fork, settle, and telepath serving')
+        print('\nPASS: Both bugs fixed — no SIGTERM, telepath queries succeed')
         os._exit(0)
     else:
-        print('\nFAIL: Workers did not survive')
+        print('\nFAIL: Test did not complete successfully')
         os._exit(1)
 
 

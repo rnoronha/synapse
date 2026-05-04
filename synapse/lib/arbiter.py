@@ -27,6 +27,22 @@ SHUTDOWN_POLL = 0.1
 MEMLOCK_JOIN_TIMEOUT = 5.0
 
 
+def _shutdown_forkpool():
+    '''Shut down the forkserver process pool before forking.
+
+    The forkserver pool (ProcessPoolExecutor) spawns worker processes
+    (SpawnProcess-1/2/3) that live in the parent's process group.  If we
+    fork without shutting it down first, the forkserver workers receive
+    SIGTERM from process group cleanup and die during startup.
+    '''
+    import synapse.lib.processpool as s_processpool
+    if getattr(s_processpool, 'forkpool', None) is not None:
+        s_processpool.forkpool.shutdown(wait=True)
+        s_processpool.forkpool = None
+        s_processpool.forkpool_sema = None
+        logger.info('Shut down forkserver pool before fork')
+
+
 def _stop_memlock_threads():
     '''Signal all slab memlock threads to stop and wait for them to exit.
 
@@ -113,6 +129,7 @@ class Arbiter:
         self._num_workers = num_workers
         self._worker_main = worker_main
 
+        _shutdown_forkpool()
         _stop_memlock_threads()
         _close_all_slabs()
 
