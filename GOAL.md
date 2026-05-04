@@ -1,24 +1,28 @@
-# Goal: v3 Fork Architecture — Production-Ready Multi-Process Cortex
+# Goal: Replace regex classify() with readonly:true try-forward
 
 ## End State
-The Synapse Cortex uses a post-init fork architecture where N worker processes inherit the listening socket and serve read queries directly, bypassing the writer's event loop. Writes are forwarded to the writer via UDS. The architecture passes all 8 test scripts with <1% error rate under sustained load.
+Workers execute ALL Storm queries with `readonly:true`. If the query succeeds, stream results to client. If it raises `IsReadOnly`, forward to the writer via UDS. The regex-based `classify()` function is removed from the critical path — Synapse's own readonly enforcement handles all edge cases.
 
 ## Acceptance Criteria
-1. Parallel-reads: >1400 QPS on c5.4xlarge (16 cores, 8 workers) — MET (1465 QPS)
-2. Throughput speedup: >4x concurrent vs sequential — MET (4.68x)
-3. Mixed-load: >3000 ops/s with 10% writes, 0 errors — MET (3370 ops/s)
-4. Correctness: 26/26 read queries identical to single-process — MET
-5. Soak: <1% error rate under 100 read + 30 write TPS for 10 minutes — NOT MET (50.8% → fix deployed, verifying)
-6. Write forwarding: 100% RAW consistency at ≤10 ops/s, degrades at 50 ops/s (writer saturation) — PARTIALLY MET
-7. Recovery: kill worker → failover → respawn, kill all → writer fallback → respawn all — MET (10/10)
-8. Write handling: writes forwarded to writer (not executed on workers) — MET (v3 forwards writes correctly)
+1. Workers set `readonly:true` in Storm opts for all incoming queries
+2. Read queries execute locally on workers without hitting the writer
+3. Write queries raise IsReadOnly on the worker, get forwarded to writer, succeed
+4. Mixed queries (reads with write side-effects) are correctly caught and forwarded
+5. No regression in read throughput (>1400 QPS on c5.4xlarge)
+6. No regression in soak error rate (<1%)
+7. The regex classify() is demoted to optional fast-path hint (not required for correctness)
+8. Local test_v3_fork.py passes with readonly:true enforcement
 
 ## Constraints
-- Python 3.11 (no EPOLLEXCLUSIVE — use fallback)
-- Single telepath URL (clients don't change)
-- Must pass local test_v3_fork.py before EC2 deployment
+- Must work with Python 3.11
+- Must not change the telepath protocol (single URL preserved)
+- Must handle all Storm syntax including lib functions, package commands, subqueries
+- The regex fast-path is optional — if removed entirely, the system must still work
 
 ## Out of Scope
-- v2 QueryRouter/ReaderManager removal (Phase 2, after v3 validated)
-- AST-based query classification (separate bead)
-- Production CDK deployment changes
+- AST walking/parsing (the whole point is to NOT reimplement write detection)
+- Changes to Synapse's readonly enforcement itself
+- v2 QueryRouter changes (v3 fork only)
+
+## Revision History
+- 2026-05-04 — Initial goal
