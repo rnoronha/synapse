@@ -140,6 +140,17 @@ def worker_main(listening_sock_fd, uds_path, datadir, cell=None):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # Rebind all inherited Base objects to the worker's new event loop.
+    # Without this, the Cell and its children reference the dead init loop.
+    if cell is not None:
+        import gc
+        import synapse.lib.base as s_base
+        for obj in gc.get_objects():
+            if isinstance(obj, s_base.Base) and obj.anitted:
+                obj.loop = loop
+                obj.finievt = asyncio.Event()
+        cell.loop = loop
+
     worker = ReadOnlyWorker(listening_sock_fd, uds_path, cell=cell)
     try:
         loop.run_until_complete(worker.serve())
