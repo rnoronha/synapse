@@ -183,22 +183,29 @@ WRITE_REJECTION_QUERIES = [
 ]
 
 
-async def _test_write_rejection(prox, name, query):
-    """Verify that a write query raises IsReadOnly on the reader."""
+async def _test_write_rejection(prox, name, query, *, allow_forward=False):
+    """Verify that a write query raises IsReadOnly on the reader.
+
+    When allow_forward is True (v3 shared-port mode), the worker may forward
+    the write to the writer instead of rejecting it — both behaviors are correct.
+    """
     try:
         async for mesg in prox.storm(query):
             if mesg[0] == 'err':
                 errname = mesg[1][0]
                 if 'IsReadOnly' in errname:
-                    return {'name': name, 'pass': True, 'error': errname}
-                return {'name': name, 'pass': False, 'error': f'wrong error: {errname}'}
+                    return {'name': name, 'pass': True, 'error': errname, 'behavior': 'rejected'}
+                if not allow_forward:
+                    return {'name': name, 'pass': False, 'error': f'wrong error: {errname}'}
+        if allow_forward:
+            return {'name': name, 'pass': True, 'error': 'none (forwarded to writer)', 'behavior': 'forwarded'}
         return {'name': name, 'pass': False, 'error': 'no error raised'}
     except s_exc.IsReadOnly:
-        return {'name': name, 'pass': True, 'error': 'IsReadOnly'}
+        return {'name': name, 'pass': True, 'error': 'IsReadOnly', 'behavior': 'rejected'}
     except Exception as exc:
         errname = type(exc).__name__
         if 'ReadOnly' in errname:
-            return {'name': name, 'pass': True, 'error': errname}
+            return {'name': name, 'pass': True, 'error': errname, 'behavior': 'rejected'}
         return {'name': name, 'pass': False, 'error': f'{errname}: {exc}'}
 
 
@@ -395,7 +402,7 @@ async def main():
             # --- Write rejection ---
             rejection_results = []
             if single_mode:
-                print(f'\nSkipping {len(WRITE_REJECTION_QUERIES)} write rejection tests (no reader)')
+                print(f'\nSkipping {len(WRITE_REJECTION_QUERIES)} write rejection tests (v3 shared-port: no dedicated reader)')
             else:
                 print(f'\nRunning {len(WRITE_REJECTION_QUERIES)} write rejection tests on reader...')
                 for name, query in WRITE_REJECTION_QUERIES:

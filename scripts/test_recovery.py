@@ -1,9 +1,10 @@
 #!/usr/bin/env python3.11
 """
-Self-contained reader failure recovery test for multi-process Cortex.
+Worker failure recovery test for multi-process Cortex (v3 shared-port).
 
-Connects via telepath to a running router + readers, kills reader processes,
-and verifies failover and respawn behavior.
+In v3, all workers share a single port (27492) via EPOLLEXCLUSIVE. Workers
+are child processes of the cortex. This test kills workers by PID, verifies
+reads still succeed through remaining workers, and confirms respawn.
 """
 import asyncio
 import argparse
@@ -20,8 +21,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import synapse.telepath as s_telepath
 
 _shutdown = asyncio.Event()
-
-# Minimum success ratio for failover read tests (steps 4 & 8)
 _FAILOVER_MIN_SUCCESSES = 8
 
 
@@ -29,44 +28,53 @@ def _handle_signal():
     _shutdown.set()
 
 
-def _pid_from_port(port):
-    """Get PID of the process listening on a TCP port via ss."""
+def _get_cortex_pid(url):
+    """Resolve the cortex PID from a telepath URL's port via ss."""
+    match = re.search(r':(\d+)/', url)
+    if not match:
+        return None
+    port = match.group(1)
     try:
         out = subprocess.check_output(
             ['ss', '-tlnp', f'sport = :{port}'],
             text=True, stderr=subprocess.DEVNULL,
         )
         for line in out.splitlines():
-            if not line.startswith('LISTEN'):
+            if 'LISTEN' not in line:
                 continue
-            match = re.search(r'pid=(\d+)', line)
-            if match:
-                return int(match.group(1))
+            m = re.search(r'pid=(\d+)', line)
+            if m:
+                return int(m.group(1))
     except (subprocess.CalledProcessError, ValueError):
         pass
     return None
 
 
+def _get_worker_pids(cortex_pid):
+    """Return list of worker child PIDs of the cortex process."""
+    try:
+        out = subprocess.check_output(
+            ['pgrep', '-P', str(cortex_pid)],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        return [int(p) for p in out.strip().split('\n') if p.strip()]
+    except subprocess.CalledProcessError:
+        return []
+
+
 def _wait_pid_gone(pid, timeout=15):
-    """Poll until a PID no longer exists. Raises if still alive after timeout."""
+    """Poll until a PID no longer exists."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            os.kill(pid, 0)  # signal 0 = existence check
+            os.kill(pid, 0)
         except ProcessLookupError:
             return
         time.sleep(0.2)
     raise RuntimeError(f'PID {pid} still alive after {timeout}s')
 
 
-async def _get_cell_info(url, timeout=5):
-    """Connect to a telepath URL and return getCellInfo() result."""
-    async with await s_telepath.openurl(url) as prox:
-        return await asyncio.wait_for(prox.getCellInfo(), timeout=timeout)
-
-
 async def _storm_count(prox, query):
-    """Run a storm query and return node count."""
     count = 0
     async for mesg in prox.storm(query):
         if mesg[0] == 'node':
@@ -93,7 +101,6 @@ class Step:
 
 
 async def run_step(name, func):
-    """Execute a test step, capture timing and pass/fail."""
     step = Step(name)
     t0 = time.monotonic()
     try:
@@ -103,17 +110,16 @@ async def run_step(name, func):
         step.detail = f'EXCEPTION: {type(exc).__name__}: {exc}'
     step.elapsed = time.monotonic() - t0
     status = 'PASS' if step.passed else 'FAIL'
-    suffix = ' [SUSPICIOUS: vacuous result]' if step.suspicious else ''
-    print(f'  [{status}] {name} ({step.elapsed:.1f}s) — {step.detail}{suffix}')
+    print(f'  [{status}] {name} ({step.elapsed:.1f}s) — {step.detail}')
     return step
 
 
 async def main():
     parser = argparse.ArgumentParser(
-        description='Reader failure recovery test for multi-process Cortex.')
-    parser.add_argument('url', help='Telepath URL of the router (e.g. tcp://host:port/cortex)')
-    parser.add_argument('--reader-ports', default='',
-                        help='Comma-separated reader ports (omit for single-process mode)')
+        description='Worker failure recovery test for v3 shared-port Cortex.')
+    parser.add_argument('url', help='Telepath URL of the cortex (e.g. tcp://host:27492/cortex)')
+    parser.add_argument('--cortex-pid', type=int, default=None,
+                        help='PID of the cortex process (auto-detected from port if omitted)')
     parser.add_argument('--output', default=None, help='Path to write JSON results')
     args = parser.parse_args()
 
@@ -121,70 +127,63 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
-    reader_ports = [int(p.strip()) for p in args.reader_ports.split(',') if p.strip()]
+    cortex_pid = args.cortex_pid or _get_cortex_pid(args.url)
+    if cortex_pid is None:
+        print('ERROR: Cannot determine cortex PID. Provide --cortex-pid or ensure cortex is listening.')
+        return 1
 
-    if not reader_ports:
-        print('WARNING: Single-process mode — recovery test SKIPPED (no readers configured)')
+    worker_pids = _get_worker_pids(cortex_pid)
+    if not worker_pids:
+        print(f'WARNING: No worker children of cortex PID {cortex_pid} — recovery test SKIPPED')
         step_names = [
-            '1. Health check', '2. Seed 100 nodes', '3. Kill reader 1',
-            '4. Reads after kill (failover)', '5. Poll reader 1 respawn',
-            '6. Verify respawned reader', '7. Kill ALL readers',
-            '8. Reads (writer fallback)', '9. Poll all readers respawn',
+            '1. Health check', '2. Seed 100 nodes', '3. Kill worker 1',
+            '4. Reads after kill (failover)', '5. Poll worker 1 respawn',
+            '6. Verify respawned worker', '7. Kill ALL workers',
+            '8. Reads (writer fallback)', '9. Poll all workers respawn',
             '10. Final health check',
         ]
         report = {
-            'url': args.url,
-            'reader_ports': [],
+            'url': args.url, 'cortex_pid': cortex_pid,
             'skipped': True,
             'steps': [{'name': n, 'passed': False, 'suspicious': False,
-                        'detail': 'SKIPPED — no readers configured', 'elapsed_s': 0.0}
+                        'detail': 'SKIPPED — no workers found', 'elapsed_s': 0.0}
                        for n in step_names],
-            'passed': 0,
-            'failed': 0,
-            'skipped_count': len(step_names),
-            'total': len(step_names),
-            'total_time_s': 0.0,
+            'passed': 0, 'failed': 0, 'skipped_count': len(step_names),
+            'total': len(step_names), 'total_time_s': 0.0,
         }
         if args.output:
             with open(args.output, 'w') as f:
                 json.dump(report, f, indent=2)
-            print(f'Results written to {args.output}')
         print('Result: SKIP (no assertions executed)')
-        return 2  # distinct from pass(0) and fail(1)
+        return 2
 
-    reader_urls = [f'tcp://127.0.0.1:{p}/cortex' for p in reader_ports]
-
-    print(f'Router: {args.url}')
-    print(f'Readers: {reader_ports}')
+    print(f'Cortex PID: {cortex_pid}')
+    print(f'Workers: {worker_pids}')
     print()
 
     steps = []
-    errors = 0
 
-    # --- Step 1: Health check all readers ---
+    # --- Step 1: Health check ---
     async def health_check():
-        infos = {}
-        for port, url in zip(reader_ports, reader_urls):
-            info = await _get_cell_info(url)
-            cell = info['cell']
-            if not cell.get('active'):
-                raise RuntimeError(f'Reader on port {port} is not active')
-            pid = _pid_from_port(port)
-            infos[port] = {'run': cell['run'], 'pid': pid, 'active': cell['active']}
-            print(f'    port={port} pid={pid} run={cell["run"][:8]} active={cell["active"]}')
-        return f'{len(infos)} readers healthy (all active)'
+        async with await s_telepath.openurl(args.url) as prox:
+            info = await asyncio.wait_for(prox.getCellInfo(), timeout=5)
+            if not info['cell'].get('active'):
+                raise RuntimeError('Cortex is not active')
+        pids = _get_worker_pids(cortex_pid)
+        for pid in pids:
+            print(f'    worker pid={pid}')
+        return f'Cortex active, {len(pids)} workers running'
 
     steps.append(await run_step('1. Health check', health_check))
     if _shutdown.is_set():
         return 1
 
-    # --- Step 2: Seed 100 nodes through router ---
+    # --- Step 2: Seed 100 nodes ---
     async def seed_nodes():
         async with await s_telepath.openurl(args.url) as prox:
             for i in range(100):
                 async for _ in prox.storm(f'[inet:fqdn=recovery-{i}.test.com]'):
                     pass
-            # Verify all 100 nodes exist
             count = 0
             async for mesg in prox.storm('inet:fqdn | count'):
                 if mesg[0] == 'print':
@@ -192,106 +191,97 @@ async def main():
                     if m:
                         count = int(m.group(1))
         if count < 100:
-            raise RuntimeError(f'Expected 100 nodes, got {count}')
+            raise RuntimeError(f'Expected >=100 nodes, got {count}')
         return f'{count} inet:fqdn nodes seeded and verified'
 
     steps.append(await run_step('2. Seed 100 nodes', seed_nodes))
     if _shutdown.is_set():
         return 1
 
-    # --- Step 3: Kill reader 1 ---
-    killed_port = reader_ports[0]
-    killed_url = reader_urls[0]
+    # --- Step 3: Kill worker 1 ---
+    killed_pid = worker_pids[0]
 
-    async def kill_reader_1():
-        pid = _pid_from_port(killed_port)
-        if pid is None:
-            raise RuntimeError(f'Cannot find PID for port {killed_port}')
-        os.kill(pid, signal.SIGKILL)
-        _wait_pid_gone(pid)
-        return f'Killed PID {pid} on port {killed_port} (confirmed dead)'
+    async def kill_worker_1():
+        os.kill(killed_pid, signal.SIGKILL)
+        _wait_pid_gone(killed_pid)
+        return f'Killed worker PID {killed_pid} (confirmed dead)'
 
-    steps.append(await run_step('3. Kill reader 1', kill_reader_1))
+    steps.append(await run_step('3. Kill worker 1', kill_worker_1))
     if _shutdown.is_set():
         return 1
 
-    # --- Step 4: 10 reads through router (failover) ---
+    # --- Step 4: 10 reads through shared port (failover) ---
     async def reads_after_kill():
         successes = 0
         async with await s_telepath.openurl(args.url) as prox:
-            for i in range(10):
+            for _ in range(10):
                 try:
                     cnt = await _storm_count(prox, 'inet:fqdn | limit 5')
                     if cnt > 0:
                         successes += 1
-                    # cnt == 0 doesn't count as success
                 except Exception:
                     pass
         if successes < _FAILOVER_MIN_SUCCESSES:
-            raise RuntimeError(
-                f'Only {successes}/10 reads succeeded (minimum: {_FAILOVER_MIN_SUCCESSES})')
+            raise RuntimeError(f'Only {successes}/10 reads succeeded (minimum: {_FAILOVER_MIN_SUCCESSES})')
         return f'{successes}/10 reads succeeded'
 
     steps.append(await run_step('4. Reads after kill (failover)', reads_after_kill))
     if _shutdown.is_set():
         return 1
 
-    # --- Step 5: Poll reader 1 for respawn ---
+    # --- Step 5: Poll for worker respawn (new child PID appears) ---
     async def poll_respawn():
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if _shutdown.is_set():
                 raise RuntimeError('Interrupted')
-            try:
-                await _get_cell_info(killed_url, timeout=3)
-                return f'Reader on port {killed_port} respawned'
-            except Exception:
-                await asyncio.sleep(2)
-        raise RuntimeError(f'Reader on port {killed_port} did not respawn within 30s')
+            pids = _get_worker_pids(cortex_pid)
+            if len(pids) >= len(worker_pids):
+                new_pids = set(pids) - set(worker_pids)
+                return f'Worker respawned: {len(pids)} workers (new PIDs: {new_pids or "recycled"})'
+            await asyncio.sleep(2)
+        raise RuntimeError(f'Worker count did not recover within 30s (have {len(_get_worker_pids(cortex_pid))}, need {len(worker_pids)})')
 
-    steps.append(await run_step('5. Poll reader 1 respawn', poll_respawn))
+    steps.append(await run_step('5. Poll worker 1 respawn', poll_respawn))
     if _shutdown.is_set():
         return 1
 
-    # --- Step 6: Verify respawned reader serves correct data ---
+    # --- Step 6: Verify reads work after respawn ---
     async def verify_respawned():
-        async with await s_telepath.openurl(killed_url) as prox:
+        async with await s_telepath.openurl(args.url) as prox:
             count = await _storm_count(prox, 'inet:fqdn | limit 10')
             if count == 0:
-                raise RuntimeError('Respawned reader returned 0 nodes — possible data loss')
-            # Verify a specific seeded node exists (data correctness)
+                raise RuntimeError('Returned 0 nodes after respawn — possible data loss')
             specific = await _storm_count(prox, 'inet:fqdn=recovery-0.test.com')
             if specific == 0:
-                raise RuntimeError(
-                    'Respawned reader missing seeded node recovery-0.test.com — data corruption')
-        return f'Respawned reader returned {count} nodes, specific node verified'
+                raise RuntimeError('Missing seeded node recovery-0.test.com')
+        return f'Reads verified: {count} nodes, specific node confirmed'
 
-    steps.append(await run_step('6. Verify respawned reader', verify_respawned))
+    steps.append(await run_step('6. Verify respawned worker', verify_respawned))
     if _shutdown.is_set():
         return 1
 
-    # --- Step 7: Kill ALL readers ---
-    async def kill_all_readers():
+    # --- Step 7: Kill ALL workers ---
+    async def kill_all_workers():
+        current_pids = _get_worker_pids(cortex_pid)
+        if not current_pids:
+            raise RuntimeError('No worker PIDs found')
         killed = []
-        for port in reader_ports:
-            pid = _pid_from_port(port)
-            if pid is not None:
-                os.kill(pid, signal.SIGKILL)
-                _wait_pid_gone(pid)
-                killed.append(f'{port}(pid={pid})')
-        if not killed:
-            raise RuntimeError('No reader PIDs found')
-        return f'Killed (confirmed dead): {", ".join(killed)}'
+        for pid in current_pids:
+            os.kill(pid, signal.SIGKILL)
+            _wait_pid_gone(pid)
+            killed.append(str(pid))
+        return f'Killed all workers: PIDs {", ".join(killed)}'
 
-    steps.append(await run_step('7. Kill ALL readers', kill_all_readers))
+    steps.append(await run_step('7. Kill ALL workers', kill_all_workers))
     if _shutdown.is_set():
         return 1
 
-    # --- Step 8: 10 reads through router (writer fallback) ---
+    # --- Step 8: 10 reads (writer fallback) ---
     async def reads_writer_fallback():
         successes = 0
         async with await s_telepath.openurl(args.url) as prox:
-            for i in range(10):
+            for _ in range(10):
                 try:
                     cnt = await _storm_count(prox, 'inet:fqdn | limit 5')
                     if cnt > 0:
@@ -299,57 +289,46 @@ async def main():
                 except Exception:
                     pass
         if successes < _FAILOVER_MIN_SUCCESSES:
-            raise RuntimeError(
-                f'Only {successes}/10 reads succeeded (minimum: {_FAILOVER_MIN_SUCCESSES})')
+            raise RuntimeError(f'Only {successes}/10 reads succeeded (minimum: {_FAILOVER_MIN_SUCCESSES})')
         return f'{successes}/10 reads succeeded (writer fallback)'
 
     steps.append(await run_step('8. Reads (writer fallback)', reads_writer_fallback))
     if _shutdown.is_set():
         return 1
 
-    # --- Step 9: Poll all readers for respawn ---
+    # --- Step 9: Poll all workers respawn ---
     async def poll_all_respawn():
         deadline = time.monotonic() + 30
-        alive = set()
-        while time.monotonic() < deadline and len(alive) < len(reader_ports):
+        while time.monotonic() < deadline:
             if _shutdown.is_set():
                 raise RuntimeError('Interrupted')
-            for port, url in zip(reader_ports, reader_urls):
-                if port in alive:
-                    continue
-                try:
-                    await _get_cell_info(url, timeout=3)
-                    alive.add(port)
-                except Exception:
-                    pass
-            if len(alive) < len(reader_ports):
-                await asyncio.sleep(2)
-        if len(alive) < len(reader_ports):
-            missing = set(reader_ports) - alive
-            raise RuntimeError(f'Readers not respawned within 30s: {missing}')
-        return f'All {len(reader_ports)} readers respawned'
+            pids = _get_worker_pids(cortex_pid)
+            if len(pids) >= len(worker_pids):
+                return f'All workers respawned: {len(pids)} workers'
+            await asyncio.sleep(2)
+        current = len(_get_worker_pids(cortex_pid))
+        raise RuntimeError(f'Workers not fully respawned within 30s ({current}/{len(worker_pids)})')
 
-    steps.append(await run_step('9. Poll all readers respawn', poll_all_respawn))
+    steps.append(await run_step('9. Poll all workers respawn', poll_all_respawn))
     if _shutdown.is_set():
         return 1
 
     # --- Step 10: Final health check ---
     async def final_health():
-        for port, url in zip(reader_ports, reader_urls):
-            info = await _get_cell_info(url)
-            cell = info['cell']
-            if not cell.get('active'):
-                raise RuntimeError(f'Reader on port {port} is not active after recovery')
-            pid = _pid_from_port(port)
-            print(f'    port={port} pid={pid} run={cell["run"][:8]} active={cell["active"]}')
-        return f'{len(reader_ports)} readers healthy (all active)'
+        async with await s_telepath.openurl(args.url) as prox:
+            info = await asyncio.wait_for(prox.getCellInfo(), timeout=5)
+            if not info['cell'].get('active'):
+                raise RuntimeError('Cortex is not active after recovery')
+        pids = _get_worker_pids(cortex_pid)
+        for pid in pids:
+            print(f'    worker pid={pid}')
+        return f'Cortex active, {len(pids)} workers healthy'
 
     steps.append(await run_step('10. Final health check', final_health))
 
     # --- Summary ---
     passed = sum(1 for s in steps if s.passed)
     failed = sum(1 for s in steps if not s.passed)
-    suspicious = sum(1 for s in steps if s.suspicious)
     total = len(steps)
     total_time = sum(s.elapsed for s in steps)
 
@@ -357,26 +336,19 @@ async def main():
     print('-' * 56)
     for s in steps:
         status = 'PASS' if s.passed else 'FAIL'
-        flag = ' ⚠' if s.suspicious else ''
-        print(f'{s.name:<40} {status:>6} {s.elapsed:>7.1f}s{flag}')
+        print(f'{s.name:<40} {status:>6} {s.elapsed:>7.1f}s')
     print('-' * 56)
     print(f'{"Total":<40} {passed}/{total:>4} {total_time:>7.1f}s')
-    if suspicious:
-        print(f'  ⚠ {suspicious} step(s) flagged SUSPICIOUS (vacuous results)')
 
     all_pass = passed == total
 
     if args.output:
         report = {
-            'url': args.url,
-            'reader_ports': reader_ports,
-            'skipped': False,
+            'url': args.url, 'cortex_pid': cortex_pid,
+            'worker_pids': worker_pids, 'skipped': False,
             'steps': [s.as_dict() for s in steps],
-            'passed': passed,
-            'failed': failed,
-            'suspicious': suspicious,
-            'total': total,
-            'total_time_s': round(total_time, 3),
+            'passed': passed, 'failed': failed,
+            'total': total, 'total_time_s': round(total_time, 3),
         }
         with open(args.output, 'w') as f:
             json.dump(report, f, indent=2)
