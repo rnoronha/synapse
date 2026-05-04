@@ -16,17 +16,23 @@ from synapse.lib.writechannel import WriteChannelListener
 
 
 class MockCell:
-    '''Minimal mock cell that provides storm() as an async generator.'''
+    '''Minimal mock cell that provides storm() and callStorm().'''
 
-    def __init__(self, messages=None, error=None):
+    def __init__(self, messages=None, error=None, call_result=None):
         self._messages = messages or []
         self._error = error
+        self._call_result = call_result
 
     async def storm(self, text, opts=None):
         if self._error:
             raise self._error
         for msg in self._messages:
             yield msg
+
+    async def callStorm(self, text, opts=None):
+        if self._error:
+            raise self._error
+        return self._call_result
 
 
 def _pack(obj):
@@ -226,6 +232,100 @@ class TestWriteChannelListener(unittest.TestCase):
         self.assertEqual(len(r2_msgs), 2)  # 1 msg + 1 done
         self.assertEqual(r1_msgs[-1][0], 'done')
         self.assertEqual(r2_msgs[-1][0], 'done')
+
+    def test_callStorm(self):
+        '''Writer returns result for callStorm requests.'''
+        worker_end, writer_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        worker_fd = worker_end.fileno()
+        writer_fd = writer_end.fileno()
+        worker_end.detach()
+        writer_end.detach()
+
+        cell = MockCell(call_result='test-result-value')
+        listener = WriteChannelListener(cell, [writer_fd])
+
+        async def _test():
+            await listener.start()
+
+            import fcntl
+            flags = fcntl.fcntl(worker_fd, fcntl.F_GETFL)
+            fcntl.fcntl(worker_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+            req = ('callStorm', 'req-cs', '[ inet:fqdn=x.com ] return($node.repr())', None)
+            os.write(worker_fd, _pack(req))
+
+            unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+            msgs = []
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                try:
+                    data = os.read(worker_fd, 65536)
+                except BlockingIOError:
+                    continue
+                if data:
+                    unpacker.feed(data)
+                    for m in unpacker:
+                        msgs.append(m)
+                    if any(m[0] in ('result', 'err') for m in msgs):
+                        break
+
+            await listener.stop()
+            return msgs
+
+        msgs = self._run(_test())
+        os.close(worker_fd)
+
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0][0], 'result')
+        self.assertEqual(msgs[0][1], 'req-cs')
+        self.assertEqual(msgs[0][2], 'test-result-value')
+
+    def test_callStorm_error(self):
+        '''Writer sends err response when callStorm() raises.'''
+        worker_end, writer_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        worker_fd = worker_end.fileno()
+        writer_fd = writer_end.fileno()
+        worker_end.detach()
+        writer_end.detach()
+
+        cell = MockCell(error=RuntimeError('callStorm failed'))
+        listener = WriteChannelListener(cell, [writer_fd])
+
+        async def _test():
+            await listener.start()
+
+            import fcntl
+            flags = fcntl.fcntl(worker_fd, fcntl.F_GETFL)
+            fcntl.fcntl(worker_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+            req = ('callStorm', 'req-cse', 'bad query', None)
+            os.write(worker_fd, _pack(req))
+
+            unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+            msgs = []
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                try:
+                    data = os.read(worker_fd, 65536)
+                except BlockingIOError:
+                    continue
+                if data:
+                    unpacker.feed(data)
+                    for m in unpacker:
+                        msgs.append(m)
+                    if any(m[0] == 'err' for m in msgs):
+                        break
+
+            await listener.stop()
+            return msgs
+
+        msgs = self._run(_test())
+        os.close(worker_fd)
+
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0][0], 'err')
+        self.assertEqual(msgs[0][1], 'req-cse')
+        self.assertIn('callStorm failed', msgs[0][2]['mesg'])
 
     def test_worker_disconnect(self):
         '''Listener handles worker disconnect gracefully.'''

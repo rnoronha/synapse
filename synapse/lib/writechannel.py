@@ -132,6 +132,8 @@ class WriteChannelListener:
 
         if kind == 'storm':
             await self._handle_storm(fd, req_id, msg)
+        elif kind == 'callStorm':
+            await self._handle_callStorm(fd, req_id, msg)
         else:
             logger.error('Unknown write request kind %r on fd %d', kind, fd)
             self._send(fd, ('err', req_id, {'mesg': f'Unknown request kind: {kind}'}))
@@ -149,6 +151,25 @@ class WriteChannelListener:
             async for mesg in self._cell.storm(text, opts=opts):
                 self._send(fd, ('msg', req_id, mesg))
             self._send(fd, ('done', req_id))
+        except Exception as e:
+            excinfo = {
+                'mesg': str(e),
+                'err': e.__class__.__name__,
+            }
+            self._send(fd, ('err', req_id, excinfo))
+
+    async def _handle_callStorm(self, fd, req_id, msg):
+        '''Execute cell.callStorm() and return the result to the worker.'''
+        try:
+            text = msg[2]
+            opts = msg[3] if len(msg) > 3 else None
+        except (IndexError, TypeError):
+            self._send(fd, ('err', req_id, {'mesg': 'Malformed callStorm request'}))
+            return
+
+        try:
+            result = await self._cell.callStorm(text, opts=opts)
+            self._send(fd, ('result', req_id, result))
         except Exception as e:
             excinfo = {
                 'mesg': str(e),

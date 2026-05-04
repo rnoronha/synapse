@@ -4,7 +4,7 @@ ReadOnlyWorker — forked read worker for the prefork Cortex architecture.
 After the parent Cortex initializes fully, it forks N workers that inherit
 the listening socket. Each worker re-opens LMDB in readonly mode, accepts
 client connections with EPOLLEXCLUSIVE, serves reads locally, and forwards
-writes to the writer process via a Telepath UDS connection.
+writes to the writer process via msgpack RPC over a pre-connected socketpair.
 '''
 import os
 import re
@@ -15,18 +15,18 @@ import asyncio
 import logging
 
 import lmdb
+import msgpack
 
 import synapse.exc as s_exc
 import synapse.daemon as s_daemon
-import synapse.telepath as s_telepath
 import synapse.lib.link as s_link
 import synapse.lib.lmdbslab as s_lmdbslab
+import synapse.lib.msgpack as s_msgpack
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Query classification (copied from queryrouter.py — will be sole copy after
-# Phase 2 removes queryrouter.py)
+# Query classification
 # ---------------------------------------------------------------------------
 
 _write_commands = frozenset((
@@ -79,43 +79,6 @@ def classify(text):
 
 
 # ---------------------------------------------------------------------------
-# Circuit breaker
-# ---------------------------------------------------------------------------
-
-class CircuitBreaker:
-    '''Three-state circuit breaker: closed → open → half-open → closed.'''
-
-    def __init__(self, threshold=3, recovery_timeout=1.0):
-        self._failures = 0
-        self._threshold = threshold
-        self._recovery_timeout = recovery_timeout
-        self._last_failure = 0.0
-        self._state = 'closed'
-
-    @property
-    def is_open(self):
-        if self._state == 'open':
-            if time.monotonic() - self._last_failure > self._recovery_timeout:
-                self._state = 'half-open'
-                return False
-            return True
-        return False
-
-    def record_failure(self):
-        self._failures += 1
-        self._last_failure = time.monotonic()
-        if self._failures >= self._threshold:
-            self._state = 'open'
-            logger.error('Circuit breaker OPEN after %d failures', self._failures)
-
-    def record_success(self):
-        if self._state != 'closed':
-            logger.info('Circuit breaker CLOSED')
-        self._failures = 0
-        self._state = 'closed'
-
-
-# ---------------------------------------------------------------------------
 # Worker entry point (called after fork)
 # ---------------------------------------------------------------------------
 
@@ -125,7 +88,7 @@ def worker_main(control_fd, uds_path, datadir, cell=None, write_fd=None):
 
     Args:
         control_fd: File descriptor of the UDS control channel from the router.
-        uds_path: Path to the writer's UDS endpoint for write forwarding.
+        uds_path: Path to the writer's UDS endpoint (legacy, unused with write_fd).
         datadir: Cortex data directory (for LMDB slab re-open).
         cell: The inherited Cortex cell object (shared via dmon for telepath).
         write_fd: File descriptor of the write channel socketpair to the writer.
@@ -142,7 +105,6 @@ def worker_main(control_fd, uds_path, datadir, cell=None, write_fd=None):
     asyncio.set_event_loop(loop)
 
     # Rebind all inherited Base objects to the worker's new event loop.
-    # Without this, the Cell and its children reference the dead init loop.
     if cell is not None:
         import gc
         import synapse.lib.base as s_base
@@ -163,13 +125,7 @@ def worker_main(control_fd, uds_path, datadir, cell=None, write_fd=None):
 
 
 def _reopen_lmdb_readonly(datadir):
-    '''Re-open inherited LMDB slabs in readonly mode.
-
-    The parent arbiter already closed the lenv handles before fork, so we
-    must NOT close them again (double-close).  We reconnect each Slab
-    object to a fresh readonly LMDB environment so the inherited Cell
-    can serve reads through its normal data access layer.
-    '''
+    '''Re-open inherited LMDB slabs in readonly mode.'''
     for slab in list(s_lmdbslab.Slab.allslabs.values()):
         path = slab.path
         try:
@@ -187,7 +143,6 @@ def _reopen_lmdb_readonly(datadir):
             slab.xact = None
             slab.txnrefcount = 0
 
-            # Re-open all cached database handles against the new env
             old_dbnames = dict(slab.dbnames)
             slab.dbnames = {None: (None, False)}
             for name, (db, dupsort) in old_dbnames.items():
@@ -208,11 +163,15 @@ def _reopen_lmdb_readonly(datadir):
 # ReadOnlyWorker
 # ---------------------------------------------------------------------------
 
+_RECV_BUF = 65536
+_REQ_COUNTER = 0
+
+
 class ReadOnlyWorker:
     '''
     Forked read worker. Receives connection fds from the router via a UDS
     control channel, serves Storm reads locally, and forwards writes to
-    the writer via Telepath-over-UDS.
+    the writer via msgpack RPC over a pre-connected socketpair.
     '''
 
     def __init__(self, control_fd, uds_path, cell=None, write_fd=None):
@@ -220,16 +179,13 @@ class ReadOnlyWorker:
         self._uds_path = uds_path
         self._cell = cell
         self._write_fd = write_fd
+        self._write_alive = write_fd is not None
         self._dmon = None
-        self._writer_proxy = None
-        self._circuit = CircuitBreaker(threshold=3, recovery_timeout=1.0)
-        self._write_sem = None  # created in serve() inside the event loop
         self._stopping = False
         self._pid = os.getpid()
 
     async def serve(self):
         '''Main worker loop. Receives fds from router via recvmsg on control channel.'''
-        self._write_sem = asyncio.Semaphore(5)
         loop = asyncio.get_running_loop()
 
         if self._cell is not None:
@@ -247,7 +203,6 @@ class ReadOnlyWorker:
         control_sock = socket.socket(fileno=self._control_fd)
         control_sock.setblocking(False)
 
-        # Send READY to the router
         try:
             control_sock.send(b'\x52')
         except OSError:
@@ -257,11 +212,6 @@ class ReadOnlyWorker:
 
         try:
             while not self._stopping:
-                if self._circuit.is_open:
-                    await asyncio.sleep(self._circuit._recovery_timeout)
-                    continue
-
-                # Wait for the control socket to be readable
                 readable = await loop.run_in_executor(None, self._poll_control, control_sock)
                 if not readable:
                     continue
@@ -270,7 +220,6 @@ class ReadOnlyWorker:
                 if fd is None:
                     if self._stopping:
                         break
-                    # Control channel closed — router died
                     logger.warning('Worker %d: control channel closed', self._pid)
                     break
 
@@ -281,7 +230,11 @@ class ReadOnlyWorker:
             control_sock.detach()
             if self._dmon is not None:
                 await self._dmon.fini()
-            await self._close_writer_proxy()
+            if self._write_fd is not None:
+                try:
+                    os.close(self._write_fd)
+                except OSError:
+                    pass
             logger.info('Worker %d: stopped', self._pid)
 
     def _poll_control(self, control_sock):
@@ -307,22 +260,16 @@ class ReadOnlyWorker:
         link = await s_link.Link.anit(reader, writer)
         link.schedCoro(self._dmon._onLinkInit(link))
 
+    # ------------------------------------------------------------------
+    # Write forwarding via socketpair RPC
+    # ------------------------------------------------------------------
+
     def _install_write_forwarding(self):
         '''Monkey-patch cell.storm() and cell.callStorm() to forward writes.
 
-        CoreApi.storm() calls self.cell.storm(), so patching the cell methods
-        is the minimal interception point that works with the existing dmon
-        pipeline.
-
-        Strategy: execute all queries with readonly=True in Storm opts.
-        Synapse's own runtime enforces readonly — if a write is attempted,
-        IsReadOnly surfaces as an ('err', ('IsReadOnly', ...)) message in
-        the storm stream (view.storm catches exceptions and converts them)
-        or as a Python exception in callStorm.  On detection, we forward
-        the query to the writer process via UDS.
-
-        The regex classify() is retained as an optional fast-path: queries
-        that are obviously writes skip the local readonly attempt entirely.
+        Strategy: execute all queries with readonly=True. If IsReadOnly
+        surfaces, forward to the writer via the write channel socketpair.
+        Regex classify() provides a fast-path for obvious writes.
         '''
         cell = self._cell
         _orig_storm = cell.storm
@@ -330,30 +277,25 @@ class ReadOnlyWorker:
         worker = self
 
         async def _patched_storm(text, opts=None):
-            # Fast-path: skip readonly attempt for obvious writes
             if classify(text) == 'write':
-                async for mesg in worker._forward_storm(text, opts):
+                async for mesg in worker._forward_write_stream(text, opts):
                     yield mesg
                 return
 
-            # Try locally with readonly enforcement
             ropts = dict(opts) if opts else {}
             ropts['readonly'] = True
 
             async for mesg in _orig_storm(text, opts=ropts):
                 if mesg[0] == 'err' and mesg[1][0] == 'IsReadOnly':
-                    # Write detected by Synapse runtime — forward to writer
-                    async for fmesg in worker._forward_storm(text, opts):
+                    async for fmesg in worker._forward_write_stream(text, opts):
                         yield fmesg
                     return
                 yield mesg
 
         async def _patched_callStorm(text, opts=None):
-            # Fast-path: skip readonly attempt for obvious writes
             if classify(text) == 'write':
                 return await worker._forward_callStorm(text, opts)
 
-            # Try locally with readonly enforcement
             ropts = dict(opts) if opts else {}
             ropts['readonly'] = True
 
@@ -365,55 +307,72 @@ class ReadOnlyWorker:
         cell.storm = _patched_storm
         cell.callStorm = _patched_callStorm
 
-    async def _forward_storm(self, text, opts):
-        '''Forward a storm query to the writer, yielding messages.'''
-        if self._circuit.is_open:
-            raise s_exc.SynErr(mesg='Writer unavailable (circuit breaker open)')
+    async def _send_write_rpc(self, req):
+        '''Send a write RPC request and return an unpacker reading responses.'''
+        if not self._write_alive:
+            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
+
+        loop = asyncio.get_running_loop()
         try:
-            await asyncio.wait_for(self._write_sem.acquire(), timeout=30.0)
-        except asyncio.TimeoutError:
-            raise s_exc.SynErr(mesg='Write forwarding backlogged')
+            await asyncio.wait_for(
+                loop.run_in_executor(None, os.write, self._write_fd, s_msgpack.en(req)),
+                timeout=30.0)
+        except (OSError, BrokenPipeError, asyncio.TimeoutError):
+            self._write_alive = False
+            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
+
+    async def _recv_write_resp(self, unpacker):
+        '''Read one chunk from the write channel into the unpacker.'''
+        loop = asyncio.get_running_loop()
         try:
-            proxy = await self._get_writer_proxy()
-            async for mesg in proxy.storm(text, opts=opts):
-                yield mesg
-            self._circuit.record_success()
-        except (OSError, ConnectionError, asyncio.TimeoutError) as e:
-            self._circuit.record_failure()
-            raise s_exc.SynErr(mesg=f'Write forwarding failed: {e}')
-        finally:
-            self._write_sem.release()
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, os.read, self._write_fd, _RECV_BUF),
+                timeout=30.0)
+        except (OSError, BrokenPipeError, asyncio.TimeoutError):
+            self._write_alive = False
+            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
+        if not data:
+            self._write_alive = False
+            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
+        unpacker.feed(data)
+
+    async def _forward_write_stream(self, text, opts):
+        '''Forward a storm query to the writer via socketpair, yielding messages.'''
+        global _REQ_COUNTER
+        _REQ_COUNTER += 1
+        req_id = _REQ_COUNTER
+
+        await self._send_write_rpc(('storm', req_id, text, opts))
+        unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+        while True:
+            await self._recv_write_resp(unpacker)
+            for resp in unpacker:
+                if resp[1] != req_id:
+                    continue
+                if resp[0] == 'msg':
+                    yield resp[2]
+                elif resp[0] == 'done':
+                    return
+                elif resp[0] == 'err':
+                    raise s_exc.SynErr(mesg=resp[2].get('mesg', 'Write forwarding error'))
 
     async def _forward_callStorm(self, text, opts):
-        '''Forward a callStorm query to the writer, returning the result.'''
-        if self._circuit.is_open:
-            raise s_exc.SynErr(mesg='Writer unavailable (circuit breaker open)')
-        try:
-            await asyncio.wait_for(self._write_sem.acquire(), timeout=30.0)
-        except asyncio.TimeoutError:
-            raise s_exc.SynErr(mesg='Write forwarding backlogged')
-        try:
-            proxy = await self._get_writer_proxy()
-            result = await proxy.callStorm(text, opts=opts)
-            self._circuit.record_success()
-            return result
-        except (OSError, ConnectionError, asyncio.TimeoutError) as e:
-            self._circuit.record_failure()
-            raise s_exc.SynErr(mesg=f'Write forwarding failed: {e}')
-        finally:
-            self._write_sem.release()
+        '''Forward a callStorm to the writer, returning the result value.'''
+        global _REQ_COUNTER
+        _REQ_COUNTER += 1
+        req_id = _REQ_COUNTER
 
-    async def _get_writer_proxy(self):
-        '''Lazy-reconnecting Telepath proxy to the writer's UDS endpoint.'''
-        if self._writer_proxy is not None and not self._writer_proxy.isfini:
-            return self._writer_proxy
-        self._writer_proxy = await s_telepath.openurl(f'unix://{self._uds_path}')
-        return self._writer_proxy
-
-    async def _close_writer_proxy(self):
-        if self._writer_proxy is not None:
-            await self._writer_proxy.fini()
-            self._writer_proxy = None
+        await self._send_write_rpc(('callStorm', req_id, text, opts))
+        unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+        while True:
+            await self._recv_write_resp(unpacker)
+            for resp in unpacker:
+                if resp[1] != req_id:
+                    continue
+                if resp[0] == 'result':
+                    return resp[2]
+                elif resp[0] == 'err':
+                    raise s_exc.SynErr(mesg=resp[2].get('mesg', 'Write forwarding error'))
 
     def shutdown(self):
         '''Signal the worker to stop accepting new connections.'''

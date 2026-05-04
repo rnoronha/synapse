@@ -101,8 +101,8 @@ def main():
     stderr_capture.truncate(0)
     stderr_capture.seek(0)
 
-    def _worker_entry(control_fd, uds_path_arg, worker_id):
-        s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell)
+    def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None):
+        s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell, write_fd=write_fd)
 
     print(f'[phase2] Forking {NUM_WORKERS} workers...')
     arbiter = s_arbiter.Arbiter()
@@ -166,6 +166,14 @@ def main():
         # F-1 fix: Router owns the listen socket. Close our copy.
         os.close(listen_fd)
         await cell.dmon.listen(f'unix://{uds_path}')
+
+        # Start the write channel listener for direct worker→writer RPC
+        import synapse.lib.writechannel as s_writechannel
+        writer_fds = arbiter.get_writer_fds()
+        wc_listener = None
+        if writer_fds:
+            wc_listener = s_writechannel.WriteChannelListener(cell, writer_fds)
+            await wc_listener.start()
 
         # Match real cell.py: re-fire active coros and start the nexus
         cell._fireActiveCoros()
@@ -315,6 +323,8 @@ def main():
                 print(f'FAIL: worker {pid} died during soak')
                 test_ok = False
 
+        if wc_listener is not None:
+            await wc_listener.stop()
         arbiter.shutdown()
         await cell.fini()
 
