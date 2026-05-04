@@ -183,6 +183,10 @@ class ReadOnlyWorker:
         self._dmon = None
         self._stopping = False
         self._pid = os.getpid()
+        # Demux state: single reader task dispatches to per-request queues
+        self._write_lock = None       # asyncio.Lock for serializing sends
+        self._pending_reqs = {}       # {req_id: asyncio.Queue}
+        self._reader_task = None
 
     async def serve(self):
         '''Main worker loop. Receives fds from router via recvmsg on control channel.'''
@@ -276,6 +280,11 @@ class ReadOnlyWorker:
         _orig_callStorm = cell.callStorm
         worker = self
 
+        # Start the demux reader and init the send lock
+        self._write_lock = asyncio.Lock()
+        if self._write_fd is not None:
+            self._reader_task = asyncio.get_running_loop().create_task(self._demux_reader())
+
         async def _patched_storm(text, opts=None):
             if classify(text) == 'write':
                 async for mesg in worker._forward_write_stream(text, opts):
@@ -307,20 +316,43 @@ class ReadOnlyWorker:
         cell.storm = _patched_storm
         cell.callStorm = _patched_callStorm
 
+    async def _demux_reader(self):
+        '''Background task: read from write_fd and dispatch to per-request queues.'''
+        loop = asyncio.get_running_loop()
+        unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+        while self._write_alive:
+            try:
+                data = await loop.run_in_executor(None, os.read, self._write_fd, _RECV_BUF)
+            except OSError:
+                break
+            if not data:
+                break
+            unpacker.feed(data)
+            for resp in unpacker:
+                req_id = resp[1]
+                q = self._pending_reqs.get(req_id)
+                if q is not None:
+                    q.put_nowait(resp)
+        # Channel dead — signal all waiters
+        self._write_alive = False
+        for q in self._pending_reqs.values():
+            q.put_nowait(None)
+
     async def _send_write_rpc(self, req):
-        '''Send a write RPC request and return an unpacker reading responses.'''
+        '''Send a write RPC request, serialized via lock.'''
         if not self._write_alive:
             raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
 
         data = s_msgpack.en(req)
         loop = asyncio.get_running_loop()
-        try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, self._sendall, data),
-                timeout=30.0)
-        except (OSError, BrokenPipeError, asyncio.TimeoutError):
-            self._write_alive = False
-            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
+        async with self._write_lock:
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, self._sendall, data),
+                    timeout=30.0)
+            except (OSError, BrokenPipeError, asyncio.TimeoutError):
+                self._write_alive = False
+                raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
 
     def _sendall(self, data):
         '''Write all bytes to the write channel fd, handling partial writes.'''
@@ -329,40 +361,30 @@ class ReadOnlyWorker:
             sent = os.write(self._write_fd, mv)
             mv = mv[sent:]
 
-    async def _recv_write_resp(self, unpacker):
-        '''Read one chunk from the write channel into the unpacker.'''
-        loop = asyncio.get_running_loop()
-        try:
-            data = await asyncio.wait_for(
-                loop.run_in_executor(None, os.read, self._write_fd, _RECV_BUF),
-                timeout=30.0)
-        except (OSError, BrokenPipeError, asyncio.TimeoutError):
-            self._write_alive = False
-            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
-        if not data:
-            self._write_alive = False
-            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
-        unpacker.feed(data)
-
     async def _forward_write_stream(self, text, opts):
         '''Forward a storm query to the writer via socketpair, yielding messages.'''
         global _REQ_COUNTER
         _REQ_COUNTER += 1
         req_id = _REQ_COUNTER
 
-        await self._send_write_rpc(('storm', req_id, text, opts))
-        unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
-        while True:
-            await self._recv_write_resp(unpacker)
-            for resp in unpacker:
-                if resp[1] != req_id:
-                    continue
+        q = asyncio.Queue()
+        self._pending_reqs[req_id] = q
+        try:
+            await self._send_write_rpc(('storm', req_id, text, opts))
+            while True:
+                resp = await asyncio.wait_for(q.get(), timeout=30.0)
+                if resp is None:
+                    raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
                 if resp[0] == 'msg':
                     yield resp[2]
                 elif resp[0] == 'done':
                     return
                 elif resp[0] == 'err':
                     raise s_exc.SynErr(mesg=resp[2].get('mesg', 'Write forwarding error'))
+        except asyncio.TimeoutError:
+            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
+        finally:
+            self._pending_reqs.pop(req_id, None)
 
     async def _forward_callStorm(self, text, opts):
         '''Forward a callStorm to the writer, returning the result value.'''
@@ -370,17 +392,22 @@ class ReadOnlyWorker:
         _REQ_COUNTER += 1
         req_id = _REQ_COUNTER
 
-        await self._send_write_rpc(('callStorm', req_id, text, opts))
-        unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
-        while True:
-            await self._recv_write_resp(unpacker)
-            for resp in unpacker:
-                if resp[1] != req_id:
-                    continue
+        q = asyncio.Queue()
+        self._pending_reqs[req_id] = q
+        try:
+            await self._send_write_rpc(('callStorm', req_id, text, opts))
+            while True:
+                resp = await asyncio.wait_for(q.get(), timeout=30.0)
+                if resp is None:
+                    raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
                 if resp[0] == 'result':
                     return resp[2]
                 elif resp[0] == 'err':
                     raise s_exc.SynErr(mesg=resp[2].get('mesg', 'Write forwarding error'))
+        except asyncio.TimeoutError:
+            raise s_exc.SynErr(mesg='Writer unavailable (write channel dead)')
+        finally:
+            self._pending_reqs.pop(req_id, None)
 
     def shutdown(self):
         '''Signal the worker to stop accepting new connections.'''
