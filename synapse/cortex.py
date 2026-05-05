@@ -918,6 +918,12 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             'minimum': 0,
             'maximum': 100,
         },
+        'cell:router:mode': {
+            'description': "Router mode: 'thin' (default) passes connections to workers via fd passing; 'thick' owns all connections and dispatches per-query via socketpair RPC.",
+            'type': 'string',
+            'default': 'thin',
+            'enum': ['thin', 'thick'],
+        },
     }
 
     cellapi = CoreApi
@@ -1885,8 +1891,10 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             'count': count,
             'uds_path': os.path.join(self.dirn, 'worker.sock'),
             'datadir': self.dirn,
+            'router_mode': self.conf.get('cell:router:mode', 'thin'),
         }
-        logger.info('Fork mode: configured for %d worker(s)', count)
+        logger.info('Fork mode: configured for %d worker(s), router_mode=%s',
+                    count, self._forkinfo['router_mode'])
 
     async def prepareFork(self):
         '''Finalize fork setup after all init phases complete.
@@ -1918,6 +1926,20 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             return None
 
         self._forkinfo['listen_fd'] = listen_sock.fileno()
+
+        # Phase D.1: If thick mode, create a separate listen socket on port 27493
+        if self._forkinfo.get('router_mode') == 'thick':
+            thick_port = 27493
+            thick_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            thick_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            thick_sock.bind(('0.0.0.0', thick_port))
+            thick_sock.listen(128)
+            thick_sock.setblocking(False)
+            self._forkinfo['thick_listen_fd'] = thick_sock.fileno()
+            # Prevent GC from closing the socket
+            self._thick_listen_sock = thick_sock
+            logger.info('Fork mode: thick router listen socket on port %d', thick_port)
+
         return self._forkinfo
 
     def getForkInfo(self):

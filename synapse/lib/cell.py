@@ -4706,14 +4706,21 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         # reference so nothing accidentally uses it between phases.
         cell.loop = None
 
-        def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None):
-            s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell, write_fd=write_fd)
+        def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None, dispatch_fd=None):
+            s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell,
+                                 write_fd=write_fd, dispatch_fd=dispatch_fd)
 
-        arbiter = s_arbiter.Arbiter()
+        router_mode = fork_info.get('router_mode', 'thin')
+        arbiter = s_arbiter.Arbiter(router_mode=router_mode)
         arbiter.fork_workers(count, listen_fd, uds_path, _worker_entry)
 
-        # Fork the router process after workers (it needs worker UDS fds)
+        # Fork the thin router process after workers (it needs worker UDS fds)
         arbiter.fork_router(listen_fd)
+
+        # Phase D.1: Fork thick router on separate port if in thick mode
+        if router_mode == 'thick':
+            thick_listen_fd = fork_info['thick_listen_fd']
+            arbiter.fork_thick_router(thick_listen_fd)
 
         # Phase 3: Writer process creates a new event loop and serves
         async def _writer_serve():

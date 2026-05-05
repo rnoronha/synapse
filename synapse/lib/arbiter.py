@@ -98,7 +98,7 @@ def _close_all_slabs():
 class Arbiter:
     '''Fork orchestrator and worker lifecycle manager.'''
 
-    def __init__(self):
+    def __init__(self, router_mode='thin'):
         self._listen_sock = None
         self._uds_path = None
         self._worker_pids = []  # ordered list of child pids
@@ -108,8 +108,14 @@ class Arbiter:
         self._pending_restarts = []  # (slot_idx,) tuples queued by SIGCHLD handler
         self._loop = None  # set by install_loop_signal_handler
         self._router_pid = None
+        self._thick_router_pid = None
+        self._router_mode = router_mode  # 'thin' or 'thick'
         self._control_channels = {}  # {worker_id: (router_fd, worker_fd)}
         self._write_channels = {}    # {worker_id: (worker_fd, writer_fd)}
+        # Thick router dispatch channels: thick router → worker
+        self._dispatch_channels = {}  # {worker_id: (router_fd, worker_fd)}
+        # Thick router → writer dispatch channel
+        self._thick_writer_channel = None  # (router_fd, writer_fd)
 
     def fork_workers(self, num_workers, listen_sock, uds_path, worker_main):
         '''
@@ -148,6 +154,20 @@ class Arbiter:
             worker_write, writer_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             self._write_channels[i] = (worker_write.fileno(), writer_end.fileno())
             worker_write.detach()
+            writer_end.detach()
+
+        # Thick mode: create dispatch socketpairs (thick router → worker)
+        if self._router_mode == 'thick':
+            for i in range(num_workers):
+                router_end, worker_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._dispatch_channels[i] = (router_end.fileno(), worker_end.fileno())
+                router_end.detach()
+                worker_end.detach()
+
+            # Thick router → writer dispatch channel
+            router_end, writer_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._thick_writer_channel = (router_end.fileno(), writer_end.fileno())
+            router_end.detach()
             writer_end.detach()
 
         self._install_parent_signals()
@@ -191,6 +211,22 @@ class Arbiter:
                 # Close all write channel fds in router (not needed)
                 for wid, (w_worker_fd, w_writer_fd) in self._write_channels.items():
                     for fd in (w_worker_fd, w_writer_fd):
+                        if fd >= 0:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+
+                # Close dispatch channel fds in thin router (not needed)
+                for wid, (r_fd, w_fd) in self._dispatch_channels.items():
+                    for fd in (r_fd, w_fd):
+                        if fd >= 0:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+                if self._thick_writer_channel is not None:
+                    for fd in self._thick_writer_channel:
                         if fd >= 0:
                             try:
                                 os.close(fd)
@@ -241,6 +277,105 @@ class Arbiter:
         '''
         return [w_writer_fd for _, w_writer_fd in self._write_channels.values()
                 if w_writer_fd >= 0]
+
+    def fork_thick_router(self, listen_fd):
+        '''Fork the thick router process. Must be called after fork_workers().
+
+        The thick router owns all client connections on listen_fd, classifies
+        queries, and dispatches reads to workers / writes to the writer via
+        dedicated dispatch socketpairs.
+
+        Args:
+            listen_fd: The listening socket fd for the thick router (port 27493).
+
+        Returns:
+            int: PID of the thick router process.
+        '''
+        self._thick_listen_fd = listen_fd
+
+        # Build {worker_id: router_end_fd} for dispatch channels
+        dispatch_fds = {}
+        for wid, (router_fd, _) in self._dispatch_channels.items():
+            dispatch_fds[wid] = router_fd
+
+        # Writer dispatch fd (router end)
+        writer_dispatch_fd = self._thick_writer_channel[0]
+
+        pid = os.fork()
+        if pid == 0:
+            # --- child (thick router) ---
+            try:
+                # Close worker-end dispatch fds (not needed in router)
+                for wid, (_, worker_fd) in self._dispatch_channels.items():
+                    if worker_fd >= 0:
+                        try:
+                            os.close(worker_fd)
+                        except OSError:
+                            pass
+
+                # Close writer-end of thick writer channel
+                if self._thick_writer_channel[1] >= 0:
+                    try:
+                        os.close(self._thick_writer_channel[1])
+                    except OSError:
+                        pass
+
+                # Close thin router control channels (not needed)
+                for wid, (r_fd, w_fd) in self._control_channels.items():
+                    for fd in (r_fd, w_fd):
+                        if fd >= 0:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+
+                # Close write channels (not needed in thick router)
+                for wid, (w_worker_fd, w_writer_fd) in self._write_channels.items():
+                    for fd in (w_worker_fd, w_writer_fd):
+                        if fd >= 0:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+
+                _thick_router_main(listen_fd, dispatch_fds, writer_dispatch_fd)
+            except Exception:
+                logger.exception('Thick router process crashed')
+            finally:
+                os._exit(0)
+
+        # --- parent (arbiter) ---
+        self._thick_router_pid = pid
+        logger.info('Forked thick router (pid %d) on fd %d', pid, listen_fd)
+
+        # Close router-end dispatch fds in parent (only thick router uses them)
+        for wid, (router_fd, worker_fd) in list(self._dispatch_channels.items()):
+            if router_fd >= 0:
+                try:
+                    os.close(router_fd)
+                except OSError:
+                    pass
+                self._dispatch_channels[wid] = (-1, worker_fd)
+
+        # Close router-end of thick writer channel in parent
+        if self._thick_writer_channel[0] >= 0:
+            try:
+                os.close(self._thick_writer_channel[0])
+            except OSError:
+                pass
+            self._thick_writer_channel = (-1, self._thick_writer_channel[1])
+
+        return pid
+
+    def get_thick_writer_fd(self):
+        '''Return the writer-end fd of the thick router → writer dispatch channel.
+
+        Used by the writer process to receive dispatched queries from the
+        thick router.
+        '''
+        if self._thick_writer_channel is None:
+            return None
+        return self._thick_writer_channel[1]
 
     # ------------------------------------------------------------------
     # internal fork helpers
@@ -296,10 +431,36 @@ class Arbiter:
                 except OSError:
                     pass
 
+        # Close dispatch channel fds not belonging to this worker
+        for wid, (router_fd, worker_fd) in self._dispatch_channels.items():
+            if router_fd >= 0:
+                try:
+                    os.close(router_fd)
+                except OSError:
+                    pass
+            if wid != worker_id and worker_fd >= 0:
+                try:
+                    os.close(worker_fd)
+                except OSError:
+                    pass
+
+        # Close thick writer channel fds in worker (not needed)
+        if self._thick_writer_channel is not None:
+            for fd in self._thick_writer_channel:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
         # Pass the worker's control channel fd instead of the listen fd
         control_fd = self._control_channels[worker_id][1]
         write_fd = self._write_channels[worker_id][0]
-        self._worker_main(control_fd, self._uds_path, worker_id, write_fd=write_fd)
+        dispatch_fd = None
+        if self._router_mode == 'thick' and worker_id in self._dispatch_channels:
+            dispatch_fd = self._dispatch_channels[worker_id][1]
+        self._worker_main(control_fd, self._uds_path, worker_id,
+                          write_fd=write_fd, dispatch_fd=dispatch_fd)
 
     # ------------------------------------------------------------------
     # parent signal handlers
@@ -331,6 +492,16 @@ class Arbiter:
                     code = os.WEXITSTATUS(status)
                     logger.error('Router pid %d exited with code %d', pid, code)
                 self._router_pid = None
+                continue
+
+            if pid == self._thick_router_pid:
+                if os.WIFSIGNALED(status):
+                    sig = os.WTERMSIG(status)
+                    logger.error('Thick router pid %d killed by signal %d', pid, sig)
+                else:
+                    code = os.WEXITSTATUS(status)
+                    logger.error('Thick router pid %d exited with code %d', pid, code)
+                self._thick_router_pid = None
                 continue
 
             if pid in self._worker_pids:
@@ -397,6 +568,13 @@ class Arbiter:
         worker_write.detach()
         writer_end.detach()
 
+        # Create a fresh dispatch channel socketpair (thick mode)
+        if self._router_mode == 'thick':
+            router_end, worker_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._dispatch_channels[idx] = (router_end.fileno(), worker_end.fileno())
+            router_end.detach()
+            worker_end.detach()
+
         pid = os.fork()
         if pid == 0:
             try:
@@ -436,21 +614,36 @@ class Arbiter:
 
         self.fork_router(self._listen_fd)
 
+        # Also restart thick router if in thick mode (needs new dispatch fds)
+        if self._router_mode == 'thick' and self._thick_router_pid is not None:
+            try:
+                os.kill(self._thick_router_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self._thick_router_pid, 0)
+            except ChildProcessError:
+                pass
+            self._thick_router_pid = None
+            self.fork_thick_router(self._thick_listen_fd)
+
     def shutdown(self):
         '''Send SIGTERM to router first, then workers, wait with timeout, SIGKILL stragglers.'''
         self._shutdown_flag = True
 
-        # Phase 0: Stop the router first (no new connections)
-        if self._router_pid is not None:
-            try:
-                os.kill(self._router_pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(self._router_pid, 0)
-            except ChildProcessError:
-                pass
-            self._router_pid = None
+        # Phase 0: Stop routers first (no new connections)
+        for rpid_attr in ('_router_pid', '_thick_router_pid'):
+            rpid = getattr(self, rpid_attr)
+            if rpid is not None:
+                try:
+                    os.kill(rpid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(rpid, 0)
+                except ChildProcessError:
+                    pass
+                setattr(self, rpid_attr, None)
 
         alive = [p for p in self._worker_pids if p is not None]
         if not alive:
@@ -491,6 +684,49 @@ class Arbiter:
             except (ProcessLookupError, ChildProcessError):
                 pass
             self._worker_pids[i] = None
+
+
+def _thick_router_main(listen_fd, worker_dispatch_fds, writer_dispatch_fd):
+    '''Entry point for the thick router child process.
+
+    Runs an asyncio event loop hosting the ThickRouter which owns all client
+    connections, classifies queries, and dispatches to workers/writer.
+
+    Args:
+        listen_fd: Listening socket fd (port 27493).
+        worker_dispatch_fds: dict {worker_id: fd} — dispatch socketpairs to workers.
+        writer_dispatch_fd: int — dispatch socketpair to writer.
+    '''
+    import synapse.lib.thickrouter as s_thickrouter
+
+    async def _run():
+        router = s_thickrouter.ThickRouter(
+            cell=None,  # No cell in router process; dispatch-only mode
+            worker_fds=worker_dispatch_fds,
+            writer_fd=writer_dispatch_fd,
+        )
+        await router.start()
+
+        # Listen on the inherited socket fd
+        import socket as _socket
+        sock = _socket.socket(fileno=listen_fd)
+        sock.setblocking(False)
+        await router.listen(f'tcp://0.0.0.0', ssl=None, sock=sock)
+
+        # Block until shutdown signal
+        stop_event = asyncio.Event()
+
+        def _on_term():
+            stop_event.set()
+
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, _on_term)
+        loop.add_signal_handler(signal.SIGINT, _on_term)
+
+        await stop_event.wait()
+        await router.stop()
+
+    asyncio.run(_run())
 
 
 def _reopen_writer_slabs():
