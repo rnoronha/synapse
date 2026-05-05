@@ -262,8 +262,8 @@ class ThickRouter:
 
             methname, args, kwargs = todo
 
-            # Only intercept storm() calls for dispatch
-            if methname != 'storm':
+            # Intercept storm() and callStorm() for dispatch
+            if methname not in ('storm', 'callStorm'):
                 # For non-storm methods, fall through to normal t2call
                 await s_daemon.t2call(link, getattr(item, methname), args, kwargs)
                 return
@@ -279,7 +279,7 @@ class ThickRouter:
                     opts = dict(opts)
                     opts['user'] = user
 
-            await self._dispatch_and_relay(link, text, opts)
+            await self._dispatch_and_relay(link, methname, text, opts)
 
         except (asyncio.CancelledError, Exception) as e:
             if not isinstance(e, asyncio.CancelledError):
@@ -289,11 +289,14 @@ class ThickRouter:
                 retn = s_common.retnexc(e)
                 await link.tx(('t2:fini', {'retn': retn}))
 
-    async def _dispatch_and_relay(self, link, text, opts):
+    async def _dispatch_and_relay(self, link, methname, text, opts):
         '''Classify, dispatch to worker or writer, relay streaming results.'''
         classification = s_worker.classify(text)
 
-        if classification == 'write':
+        if methname == 'callStorm':
+            # callStorm always goes to writer (it's a write operation)
+            await self._relay_callstorm_to_writer(link, text, opts)
+        elif classification == 'write':
             await self._relay_to_writer(link, text, opts)
         else:
             await self._relay_to_worker(link, text, opts)
@@ -357,6 +360,38 @@ class ThickRouter:
                             {'mesg': e.excinfo.get('mesg', 'Writer error')}))
             await link.tx(('t2:yield', {'retn': retn}))
             await link.tx(('t2:yield', {'retn': None}))
+
+    async def _relay_callstorm_to_writer(self, link, text, opts):
+        '''Dispatch callStorm to the writer and return the result.'''
+        req_id = _next_req_id()
+        q = asyncio.Queue()
+        self._pending[self._writer_fd][req_id] = q
+
+        try:
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(
+                None, self._send, self._writer_fd,
+                ('callStorm', req_id, text, opts))
+            if not ok:
+                raise s_exc.SynErr(mesg='Failed to dispatch callStorm to writer')
+
+            resp = await q.get()
+            if resp is None:
+                raise s_exc.SynErr(mesg='Writer channel died during callStorm')
+
+            kind = resp[0]
+            if kind == 'result':
+                await link.tx(('t2:fini', {'retn': (True, resp[2])}))
+            elif kind == 'err':
+                excinfo = resp[2]
+                retn = (False, (excinfo.get('err', 'SynErr'),
+                                {'mesg': excinfo.get('mesg', 'Writer error')}))
+                await link.tx(('t2:fini', {'retn': retn}))
+            else:
+                raise s_exc.SynErr(mesg=f'Unexpected callStorm response: {kind}')
+
+        finally:
+            self._pending[self._writer_fd].pop(req_id, None)
 
 
 class _ExcInfo(Exception):

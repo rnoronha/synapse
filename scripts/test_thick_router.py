@@ -66,13 +66,22 @@ def _thick_router_main_with_cell(listen_fd, worker_dispatch_fds, writer_dispatch
         # Use a minimal proxy that satisfies the telepath handshake
         # without triggering full CoreApi initialization
         class _ThickRouterProxy:
-            '''Minimal proxy for telepath handshake in thick router.'''
-            pass
+            '''Minimal proxy for telepath handshake in thick router.
+            Must expose storm() as async generator for sharinfo detection.'''
+            async def storm(self, text, opts=None):
+                yield  # pragma: no cover
+
+            async def callStorm(self, text, opts=None):
+                return None  # pragma: no cover
+
+            async def getCellInfo(self):
+                return None  # pragma: no cover
 
         parent_dmon = getattr(cell, 'dmon', None)
         if parent_dmon is not None:
             for name in parent_dmon.shared:
-                router._dmon.share(name, _ThickRouterProxy())
+                proxy_obj = _ThickRouterProxy()
+                router._dmon.share(name, proxy_obj)
         else:
             router._dmon.share('*', _ThickRouterProxy())
 
@@ -136,6 +145,11 @@ def main():
             for i in range(20):
                 await snap.addNode('inet:fqdn', f'test{i}.example.com')
 
+        # Force sync all slabs to ensure data is on disk before fork
+        for slab in s_lmdbslab.Slab.allslabs.values():
+            if not slab.readonly and slab.xact is not None:
+                slab.forcecommit()
+
         # Create thick router listen socket on dynamic port
         thick_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         thick_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -170,15 +184,10 @@ def main():
 
     # Phase 2: Fork workers and thick router
     def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None, dispatch_fd=None):
-        # In thick mode, workers need to handle BOTH:
-        # 1. Thin router connections via control_fd (ReadOnlyWorker)
-        # 2. Thick router dispatch via dispatch_fd (PureWorker)
-        if dispatch_fd is not None:
-            # Run PureWorker for thick router dispatch
-            s_worker.pure_worker_main(dispatch_fd, info['datadir'], cell)
-        else:
-            s_worker.worker_main(control_fd, uds_path_arg, info['datadir'], cell=cell,
-                                 write_fd=write_fd, dispatch_fd=dispatch_fd)
+        # Workers use worker_main which handles the thin router protocol.
+        # The thick router dispatch is handled separately.
+        s_worker.worker_main(control_fd, uds_path_arg, info['datadir'], cell=cell,
+                             write_fd=write_fd, dispatch_fd=dispatch_fd)
 
     print(f'[phase2] Forking {NUM_WORKERS} workers...')
     arbiter = s_arbiter.Arbiter(router_mode='thick')
@@ -326,7 +335,6 @@ def main():
         cell.nexsroot._syn_refs -= 3
 
         s_arbiter._reopen_writer_slabs()
-        print('[phase3] Writer slabs reopened')
         arbiter.install_loop_signal_handler(cell.loop)
 
         cell.dmon.listenservers.clear()
@@ -341,7 +349,6 @@ def main():
             pass
         os.close(listen_fd)
         await cell.dmon.listen(f'unix://{uds_path}')
-        print('[phase3] UDS listener ready')
 
         # Start write channel listener (worker → writer)
         import synapse.lib.writechannel as s_writechannel
@@ -366,7 +373,6 @@ def main():
 
         # Give thick router time to start its event loop and listen
         await asyncio.sleep(2.0)
-        print('[phase3] Writer ready, starting tests...')
 
         url = f'tcp://127.0.0.1:{thick_port}/cortex'
 
