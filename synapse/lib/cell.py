@@ -4739,6 +4739,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             s_glob._glob_thrd = threading.current_thread()
 
             fini_count = 0
+            evt_count = 0
+            
             for obj in gc.get_objects():
                 if isinstance(obj, s_base.Base) and obj.anitted:
                     if obj.isfini:
@@ -4746,9 +4748,25 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
                     obj.loop = new_loop
                     obj.isfini = False
                     obj.finievt = asyncio.Event()
+                    # E-6 fix: Recreate asyncio.Event attributes bound to the
+                    # dead init loop.  s_coro.Event subclasses asyncio.Event so
+                    # isinstance catches both.
+                    for attr in list(vars(obj)):
+                        if attr == 'finievt':
+                            continue
+                        val = getattr(obj, attr, None)
+                        if isinstance(val, asyncio.Event):
+                            if isinstance(val, s_coro.Event):
+                                setattr(obj, attr, s_coro.Event())
+                            else:
+                                setattr(obj, attr, asyncio.Event())
+                            evt_count += 1
+                            logger.warning('E-6 fix: Recreated %s.%s (%s)', type(obj).__name__, attr, type(val).__name__)
             cell.loop = new_loop
             if fini_count:
                 logger.warning('E-1 fix: Reset isfini on %d Base objects', fini_count)
+            if evt_count:
+                logger.warning('E-6 fix: Recreated %d asyncio.Event objects on new loop', evt_count)
 
             # E-2 fix: Decrement the extra ref we added in _initForFork
             # to prevent fini during asyncio.run() teardown.
@@ -4966,6 +4984,25 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         turl = self._getDmonListen()
         if turl is not None:
             self.sockaddr = await self.dmon.listen(turl)
+
+        # E-6 fix: Recreate asyncio.Event attributes on Base objects that are
+        # still bound to the dead init loop.
+        import gc
+        evt_count = 0
+        for obj in gc.get_objects():
+            if isinstance(obj, s_base.Base) and obj.anitted:
+                for attr in list(vars(obj)):
+                    if attr == 'finievt':
+                        continue
+                    val = getattr(obj, attr, None)
+                    if isinstance(val, asyncio.Event):
+                        if isinstance(val, s_coro.Event):
+                            setattr(obj, attr, s_coro.Event())
+                        else:
+                            setattr(obj, attr, asyncio.Event())
+                        evt_count += 1
+        if evt_count:
+            logger.info('E-6 fix: Recreated %d asyncio.Event objects on new loop', evt_count)
 
         # Re-fire active coros that were cancelled when the init loop closed
         self._fireActiveCoros()
