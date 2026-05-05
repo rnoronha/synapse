@@ -1178,7 +1178,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
 
     LOGGED_HTTPAPI_HEADERS = ('User-Agent',)
 
-    async def __anit__(self, dirn, conf=None, readonly=False, parent=None):
+    async def __anit__(self, dirn, conf=None, readonly=None, parent=None):
 
         # phase 1
         if conf is None:
@@ -1219,6 +1219,10 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             'tasks': 1,
             'issuewait': 1
         }
+
+        if readonly is None:
+            readonly = parent.readonly if parent is not None else False
+        self.readonly = readonly
 
         self.safemode = self.conf.req('safemode')
         if self.safemode:
@@ -1337,7 +1341,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
 
         self.optimizeddb = self.slab.initdb('cell:optimized')  # time -> optimization record
 
-        if self._save_optimized:
+        if self._save_optimized and not self.readonly:
             lkey = s_common.int64en(self._last_optimized['init']['time'])
             self.slab.put(lkey, s_msgpack.en(self._last_optimized), db=self.optimizeddb)
             self._save_optimized = False
@@ -1370,7 +1374,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             logger.error(mesg)
             raise s_exc.BadVersion(mesg=mesg, currver=self.VERSION, lastver=lastver)
 
-        self.cellinfo.set('cell:version', self.VERSION)
+        if not self.readonly:
+            self.cellinfo.set('cell:version', self.VERSION)
 
         # Check the synapse version didn't regress
         if (lastver := self.cellinfo.get('synapse:version')) is not None and s_version.version < lastver:
@@ -1378,7 +1383,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             logger.error(mesg)
             raise s_exc.BadVersion(mesg=mesg, currver=s_version.version, lastver=lastver)
 
-        self.cellinfo.set('synapse:version', s_version.version)
+        if not self.readonly:
+            self.cellinfo.set('synapse:version', s_version.version)
 
         self.nexsvers = self.cellinfo.get('nexus:version', (0, 0))
         self.nexspatches = ()
@@ -1390,7 +1396,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         self.auth = await self._initCellAuth()
 
         auth_passwd = self.conf.get('auth:passwd')
-        if auth_passwd is not None:
+        if auth_passwd is not None and not self.readonly:
             user = await self.auth.getUserByName('root')
 
             if not await user.tryPasswd(auth_passwd, nexs=False, enforce_policy=False):
@@ -1665,6 +1671,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         self._cellguidfd.close()
 
     def _getCellLock(self):
+        if self.readonly:
+            return
         cmd = fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
             fcntl.lockf(self._cellguidfd, cmd)
@@ -1845,6 +1853,14 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
 
     async def _bumpCellVers(self, name, updates, nexs=True):
 
+        if self.readonly:
+            curv = self.cellvers.get(name, 0)
+            reqv = updates[-1][0]
+            if curv < reqv:
+                mesg = f'Storage requires migration ({name} v{curv} -> v{reqv}). Boot in write mode first.'
+                raise s_exc.NeedConfValu(mesg=mesg)
+            return
+
         if self.inaugural:
             await self.setCellVers(name, updates[-1][0], nexs=nexs)
             return
@@ -1993,10 +2009,16 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             (2, self._driveCellMigration),
         ), nexs=False)
 
-        path = s_common.gendir(self.dirn, 'slabs', 'drive.lmdb')
+        if self.readonly:
+            path = s_common.genpath(self.dirn, 'slabs', 'drive.lmdb')
+        else:
+            path = s_common.gendir(self.dirn, 'slabs', 'drive.lmdb')
         sockpath = s_common.genpath(self.sockdirn, 'drive')
 
-        if s_common.envbool('SYNDEV_CELL_DRIVE_NOSPAWN'):
+        if self.readonly:
+            self.drive_slab = await self._initSlabFile(path, readonly=True)
+            self.drive = await s_drive.Drive.anit(self.drive_slab, s_drive.CELLDRIVE)
+        elif s_common.envbool('SYNDEV_CELL_DRIVE_NOSPAWN'):
             self.drive_slab = await self._initSlabFile(path)
             self.drive = await s_drive.Drive.anit(self.drive_slab, s_drive.CELLDRIVE)
         else:
@@ -3726,7 +3748,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             _slab.initdb('hive')
             await _slab.fini()
 
-        self.slab = await self._initSlabFile(path)
+        self.slab = await self._initSlabFile(path, readonly=readonly)
 
     async def _initCellAuth(self):
 
@@ -4120,6 +4142,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
                           help=f'The (optional) additional name to share the {name} as. This defaults to '
                                f'{telendef}, and may be also be overridden by the {telenvar} environment'
                                f' variable.')
+        pars.add_argument('--readonly', default=False, action='store_true',
+                          help='Start the cell in read-only mode.')
 
         if conf is not None:
             args = conf.getArgParseArgs()
@@ -4564,7 +4588,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         s_processpool._setPoolLogging(logconf)
 
         try:
-            cell = await cls.anit(opts.dirn, conf=conf)
+            cell = await cls.anit(opts.dirn, conf=conf, readonly=opts.readonly)
         except:
             logger.exception(f'Error starting cell at {opts.dirn}')
             raise
@@ -4620,6 +4644,213 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         cell = await cls.initFromArgv(argv, outp=outp)
 
         await cell.main()
+
+    @classmethod
+    def startmain(cls, argv, outp=None):
+        '''Sync entry point that supports the init → fork → serve lifecycle.
+
+        If the cell has fork mode enabled (getForkInfo() returns non-None),
+        the lifecycle is:
+
+        1. asyncio.run(init) — initialize the cell, event loop closes on return
+        2. os.fork() × N — fork read workers (no event loop running, safe to fork)
+        3. Writer: asyncio.run(serve) — new event loop for the writer process
+        4. Workers: each creates its own event loop via worker_main()
+
+        If fork mode is not enabled, falls back to the normal asyncio.run(execmain) path.
+        '''
+        if not cls._mayFork(argv):
+            asyncio.run(cls.execmain(argv, outp=outp))
+            return
+
+        import synapse.lib.arbiter as s_arbiter
+        import synapse.lib.worker as s_worker
+
+        if outp is None:
+            outp = s_output.stdout
+
+        # Phase 1: Initialize the cell (event loop created and destroyed by asyncio.run)
+        cell_info = asyncio.run(cls._initForFork(argv, outp=outp))
+
+        cell = cell_info['cell']
+        fork_info = cell_info.get('fork_info')
+
+        if fork_info is None:
+            # prepareFork() returned None — fall back to normal serve.
+            async def _fallback_serve():
+                cell.loop = asyncio.get_running_loop()
+                cell.isfini = False
+                cell.finievt = asyncio.Event()
+                cell.dmon.isfini = False
+                cell.dmon.finievt = asyncio.Event()
+                await cell._restoreAfterInitLoop()
+                await cell.main()
+            asyncio.run(_fallback_serve())
+            return
+
+        # Phase 2: Fork workers (no event loop running — safe to fork)
+        listen_fd = fork_info['listen_fd']
+        uds_path = fork_info['uds_path']
+        datadir = fork_info['datadir']
+        count = fork_info['count']
+
+        # E-1 fix: The init event loop is dead. Null out the stale loop reference.
+        cell.loop = None
+
+        def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None, dispatch_fd=None):
+            s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell,
+                                 write_fd=write_fd, dispatch_fd=dispatch_fd)
+
+        arbiter = s_arbiter.Arbiter()
+        arbiter.fork_workers(count, listen_fd, uds_path, _worker_entry)
+        arbiter.fork_router(listen_fd)
+
+        # Phase 3: Writer process creates a new event loop and serves
+        async def _writer_serve():
+
+            # E-1 fix: Rebind ALL Base objects to the new event loop.
+            import gc
+            import threading
+            import synapse.glob as s_glob
+            new_loop = asyncio.get_running_loop()
+
+            s_glob._glob_loop = new_loop
+            s_glob._glob_thrd = threading.current_thread()
+
+            for obj in gc.get_objects():
+                if isinstance(obj, s_base.Base) and obj.anitted:
+                    obj.loop = new_loop
+                    obj.isfini = False
+                    obj.finievt = asyncio.Event()
+                    # E-6 fix: Recreate asyncio.Event attributes bound to the dead init loop.
+                    for attr in list(vars(obj)):
+                        if attr == 'finievt':
+                            continue
+                        val = getattr(obj, attr, None)
+                        if isinstance(val, asyncio.Event):
+                            if isinstance(val, s_coro.Event):
+                                setattr(obj, attr, s_coro.Event())
+                            else:
+                                setattr(obj, attr, asyncio.Event())
+            cell.loop = new_loop
+
+            # E-2 fix: Decrement the extra ref we added in _initForFork
+            cell._syn_refs -= 1
+
+            # S-1 fix: Loop-based SIGCHLD handler for worker restarts
+            arbiter.install_loop_signal_handler(cell.loop)
+
+            # Clear stale server refs and UDS files from the init loop
+            cell.dmon.listenservers.clear()
+            for spath in (os.path.join(cell.dirn, 'sock'), uds_path):
+                try:
+                    os.unlink(spath)
+                except FileNotFoundError:
+                    pass
+
+            # Re-create the local unix socket
+            try:
+                await cell.dmon.listen(f'unix://{os.path.join(cell.dirn, "sock")}')
+            except OSError:
+                logger.warning('Failed to re-create local unix socket')
+
+            # F-1 fix: The router owns the listen socket now.
+            os.close(listen_fd)
+
+            # Re-create the UDS listener for write forwarding
+            await cell.dmon.listen(f'unix://{uds_path}')
+
+            # Start the write channel listener for direct worker→writer RPC
+            writer_fds = arbiter.get_writer_fds()
+            if writer_fds:
+                import synapse.lib.writechannel as s_writechannel
+                wc_listener = s_writechannel.WriteChannelListener(cell, writer_fds)
+                await wc_listener.start()
+
+            # Re-fire active coros that were cancelled when the init loop closed
+            cell._fireActiveCoros()
+
+            # E-5 fix: Restart the Slab sync loop.
+            s_lmdbslab.Slab.synctask = None
+            for slab in s_lmdbslab.Slab.allslabs.values():
+                if not slab.readonly:
+                    await s_lmdbslab.Slab.initSyncLoop(slab)
+                    break
+
+            await cell.main()
+
+        try:
+            asyncio.run(_writer_serve())
+        finally:
+            arbiter.shutdown()
+
+    @classmethod
+    def _mayFork(cls, argv):
+        '''Quick check whether this cell class might use fork mode.'''
+        if not hasattr(cls, 'prepareFork'):
+            return False
+
+        import yaml
+        dirn = None
+        for arg in argv:
+            if not arg.startswith('-'):
+                dirn = arg
+                break
+        if dirn is None:
+            return False
+
+        cellpath = os.path.join(dirn, 'cell.yaml')
+        try:
+            with open(cellpath) as f:
+                conf = yaml.safe_load(f) or {}
+            return conf.get('multi:process:core_pct', 0) > 0
+        except (OSError, yaml.YAMLError):
+            return False
+
+    @classmethod
+    async def _initForFork(cls, argv, outp=None):
+        '''Initialize the cell and return it with fork info.'''
+        if outp is None:
+            outp = s_output.stdout
+
+        cell = await cls.initFromArgv(argv, outp=outp)
+
+        fork_info = None
+        if hasattr(cell, 'prepareFork'):
+            fork_info = await cell.prepareFork()
+
+        if fork_info is not None:
+            fork_info['listen_fd'] = os.dup(fork_info['listen_fd'])
+
+        # Prevent the cell from being fini'd during asyncio.run() teardown.
+        cell._syn_refs += 1
+
+        return {'cell': cell, 'fork_info': fork_info}
+
+    async def _restoreAfterInitLoop(self):
+        '''Restore cell state after the init event loop has been closed.'''
+        self.dmon.listenservers.clear()
+
+        sockpath = os.path.join(self.dirn, 'sock')
+        try:
+            os.unlink(sockpath)
+        except FileNotFoundError:
+            pass
+
+        try:
+            await self.dmon.listen(f'unix://{sockpath}')
+        except OSError:
+            logger.warning('Failed to re-create local unix socket at %s', sockpath)
+
+        turl = self._getDmonListen()
+        if turl is not None:
+            self.sockaddr = await self.dmon.listen(turl)
+
+        self._fireActiveCoros()
+
+    def getForkInfo(self):
+        '''Return fork config if fork mode is active, else None.'''
+        return None
 
     async def _getCellUser(self, link, mesg):
 

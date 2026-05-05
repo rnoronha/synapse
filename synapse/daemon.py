@@ -497,6 +497,19 @@ class Daemon(s_base.Base):
         typename = valu.typename
         return ('task:fini', {'task': task, 'retn': retn, 'type': typename})
 
+    async def _ensureLinkSess(self, link):
+        sess = link.get('sess')
+        if sess is not None:
+            return sess
+        sess = await Sess.anit()
+        async def sessfini():
+            self.sessions.pop(sess.iden, None)
+        sess.onfini(sessfini)
+        link.onfini(sess.fini)
+        self.sessions[sess.iden] = sess
+        link.set('sess', sess)
+        return sess
+
     async def _onTaskV2Init(self, link: s_link.Link, mesg):
 
         # t2:init is used by the pool sockets on the client
@@ -510,12 +523,24 @@ class Daemon(s_base.Base):
                 raise s_exc.NoSuchObj(name=name)
 
             sess = self.sessions.get(sidn)
-            if sess is None:
-                raise s_exc.NoSuchObj(name=name)
 
-            item = sess.getSessItem(name)
-            if item is None:
-                raise s_exc.NoSuchObj(name=name)
+            # If the session doesn't exist locally (e.g. pool connection
+            # landed on a different fork worker), create one on-the-fly
+            # using the shared item lookup — same as tele:syn would.
+            if sess is None:
+
+                sess = await self._ensureLinkSess(link)
+                item = sess.getSessItem(name)
+                if item is None:
+                    item = await self._getSharedItem(name or '*')
+                    if item is None:
+                        raise s_exc.NoSuchObj(name=name)
+                    sess.setSessItem(name, item)
+
+            else:
+                item = sess.getSessItem(name)
+                if item is None:
+                    raise s_exc.NoSuchObj(name=name)
 
             s_scope.set('sess', sess)
             s_scope.set('link', link)
