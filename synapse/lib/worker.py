@@ -115,6 +115,22 @@ def worker_main(control_fd, uds_path, datadir, cell=None, write_fd=None, dispatc
                 obj.finievt = asyncio.Event()
         cell.loop = loop
 
+    if dispatch_fd is not None:
+        # Thick router mode — run as pure worker (socketpair task receiver)
+        # pure_worker_main handles its own LMDB reopen and event loop
+        # so we skip the ReadOnlyWorker path entirely. But worker_main
+        # already reopened LMDB and created a loop above, so just use
+        # PureWorker directly on the existing loop.
+        worker = PureWorker(dispatch_fd, cell)
+        try:
+            loop.run_until_complete(worker.serve())
+        except KeyboardInterrupt:
+            pass
+        finally:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+        return
+
     worker = ReadOnlyWorker(control_fd, uds_path, cell=cell, write_fd=write_fd)
     try:
         loop.run_until_complete(worker.serve())
