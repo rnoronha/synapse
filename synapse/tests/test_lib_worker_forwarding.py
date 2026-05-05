@@ -31,11 +31,44 @@ def _mock_writer_thread(writer_fd, responses):
                 req_id = msg[1]
                 kind = msg[0]
                 for resp in responses.get(kind, []):
-                    # Replace placeholder req_id with actual
                     out = (resp[0], req_id) + resp[2:]
-                    os.write(writer_fd, s_msgpack.en(out))
+                    buf = s_msgpack.en(out)
+                    mv = memoryview(buf)
+                    while mv:
+                        sent = os.write(writer_fd, mv)
+                        mv = mv[sent:]
     except OSError:
         pass
+
+
+def _make_worker_with_reader(loop, worker_fd):
+    '''Create a ReadOnlyWorker with write forwarding and a demux reader task.'''
+    worker = ReadOnlyWorker(0, '/tmp/unused', write_fd=worker_fd)
+    worker._write_lock = asyncio.Lock()
+    worker._write_ready = asyncio.Event()
+    worker._write_ready.set()
+
+    async def _reader():
+        unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+        while worker._write_alive:
+            try:
+                data = await loop.run_in_executor(None, os.read, worker_fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            unpacker.feed(data)
+            for resp in unpacker:
+                req_id = resp[1]
+                q = worker._pending_reqs.get(req_id)
+                if q is not None:
+                    q.put_nowait(resp)
+        worker._write_alive = False
+        for q in worker._pending_reqs.values():
+            q.put_nowait(None)
+
+    worker._reader_task = loop.create_task(_reader())
+    return worker
 
 
 class TestWorkerWriteForwarding(unittest.TestCase):
@@ -70,7 +103,7 @@ class TestWorkerWriteForwarding(unittest.TestCase):
         t.daemon = True
         t.start()
 
-        worker = ReadOnlyWorker(0, '/tmp/unused', write_fd=worker_fd)
+        worker = _make_worker_with_reader(self.loop, worker_fd)
 
         async def _test():
             msgs = []
@@ -104,7 +137,7 @@ class TestWorkerWriteForwarding(unittest.TestCase):
         t.daemon = True
         t.start()
 
-        worker = ReadOnlyWorker(0, '/tmp/unused', write_fd=worker_fd)
+        worker = _make_worker_with_reader(self.loop, worker_fd)
 
         async def _test():
             return await worker._forward_callStorm('[ inet:fqdn=test.com ] return($node.repr())', None)
@@ -133,7 +166,7 @@ class TestWorkerWriteForwarding(unittest.TestCase):
         t.daemon = True
         t.start()
 
-        worker = ReadOnlyWorker(0, '/tmp/unused', write_fd=worker_fd)
+        worker = _make_worker_with_reader(self.loop, worker_fd)
 
         async def _test():
             msgs = []
@@ -149,6 +182,9 @@ class TestWorkerWriteForwarding(unittest.TestCase):
     def test_dead_write_channel(self):
         '''Worker raises SynErr when write channel is dead.'''
         worker = ReadOnlyWorker(0, '/tmp/unused', write_fd=None)
+        worker._write_lock = asyncio.Lock()
+        worker._write_ready = asyncio.Event()
+        worker._write_ready.set()
 
         async def _test_stream():
             async for _ in worker._forward_write_stream('query', None):
@@ -175,6 +211,9 @@ class TestWorkerWriteForwarding(unittest.TestCase):
         os.close(writer_fd)
 
         worker = ReadOnlyWorker(0, '/tmp/unused', write_fd=worker_fd)
+        worker._write_lock = asyncio.Lock()
+        worker._write_ready = asyncio.Event()
+        worker._write_ready.set()
         self.assertTrue(worker._write_alive)
 
         async def _test():

@@ -14,6 +14,10 @@ import msgpack
 import synapse.lib.msgpack as s_msgpack
 from synapse.lib.writechannel import WriteChannelListener
 
+# Tests use send_ready=False since they read directly from the fd
+# without a _demux_reader that expects the ready byte.
+_TEST_SEND_READY = False
+
 
 class MockCell:
     '''Minimal mock cell that provides storm() and callStorm().'''
@@ -87,7 +91,7 @@ class TestWriteChannelListener(unittest.TestCase):
             ('node', ({'ndef': ('inet:ipv4', 0x05060708)},)),
         ]
         cell = MockCell(messages=storm_msgs)
-        listener = WriteChannelListener(cell, [writer_fd])
+        listener = WriteChannelListener(cell, [writer_fd], send_ready=_TEST_SEND_READY)
 
         async def _test():
             await listener.start()
@@ -143,7 +147,7 @@ class TestWriteChannelListener(unittest.TestCase):
         writer_end.detach()
 
         cell = MockCell(error=RuntimeError('test error'))
-        listener = WriteChannelListener(cell, [writer_fd])
+        listener = WriteChannelListener(cell, [writer_fd], send_ready=_TEST_SEND_READY)
 
         async def _test():
             await listener.start()
@@ -190,7 +194,7 @@ class TestWriteChannelListener(unittest.TestCase):
 
         storm_msgs = [('node', ({'ndef': ('test:str', 'hello')},))]
         cell = MockCell(messages=storm_msgs)
-        listener = WriteChannelListener(cell, [writer_fd])
+        listener = WriteChannelListener(cell, [writer_fd], send_ready=_TEST_SEND_READY)
 
         async def _test():
             await listener.start()
@@ -242,7 +246,7 @@ class TestWriteChannelListener(unittest.TestCase):
         writer_end.detach()
 
         cell = MockCell(call_result='test-result-value')
-        listener = WriteChannelListener(cell, [writer_fd])
+        listener = WriteChannelListener(cell, [writer_fd], send_ready=_TEST_SEND_READY)
 
         async def _test():
             await listener.start()
@@ -289,7 +293,7 @@ class TestWriteChannelListener(unittest.TestCase):
         writer_end.detach()
 
         cell = MockCell(error=RuntimeError('callStorm failed'))
-        listener = WriteChannelListener(cell, [writer_fd])
+        listener = WriteChannelListener(cell, [writer_fd], send_ready=_TEST_SEND_READY)
 
         async def _test():
             await listener.start()
@@ -336,7 +340,7 @@ class TestWriteChannelListener(unittest.TestCase):
         writer_end.detach()
 
         cell = MockCell()
-        listener = WriteChannelListener(cell, [writer_fd])
+        listener = WriteChannelListener(cell, [writer_fd], send_ready=_TEST_SEND_READY)
 
         async def _test():
             await listener.start()
@@ -347,6 +351,64 @@ class TestWriteChannelListener(unittest.TestCase):
 
         # Should not raise
         self._run(_test())
+
+    def test_burst_writes_no_data_loss(self):
+        '''Burst of rapid writes completes without data loss (partial write regression).'''
+        worker_end, writer_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        worker_fd = worker_end.fileno()
+        writer_fd = writer_end.fileno()
+        worker_end.detach()
+        writer_end.detach()
+
+        storm_msgs = [('node', ({'ndef': ('inet:ipv4', i)},)) for i in range(3)]
+        cell = MockCell(messages=storm_msgs)
+        listener = WriteChannelListener(cell, [writer_fd], send_ready=_TEST_SEND_READY)
+
+        num_requests = 20
+
+        async def _test():
+            await listener.start()
+
+            import fcntl
+            flags = fcntl.fcntl(worker_fd, fcntl.F_GETFL)
+            fcntl.fcntl(worker_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+            # Send many requests as fast as possible
+            for i in range(num_requests):
+                req = ('storm', f'burst-{i}', f'query-{i}', None)
+                data = _pack(req)
+                mv = memoryview(data)
+                while mv:
+                    try:
+                        sent = os.write(worker_fd, mv)
+                        mv = mv[sent:]
+                    except BlockingIOError:
+                        await asyncio.sleep(0.01)
+
+            unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+            done_ids = set()
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                try:
+                    data = os.read(worker_fd, 65536)
+                except BlockingIOError:
+                    continue
+                if data:
+                    unpacker.feed(data)
+                    for m in unpacker:
+                        if m[0] == 'done':
+                            done_ids.add(m[1])
+                if len(done_ids) >= num_requests:
+                    break
+
+            await listener.stop()
+            return done_ids
+
+        done_ids = self._run(_test())
+        os.close(worker_fd)
+
+        self.assertEqual(len(done_ids), num_requests,
+                         f'Expected {num_requests} done responses, got {len(done_ids)}')
 
 
 if __name__ == '__main__':

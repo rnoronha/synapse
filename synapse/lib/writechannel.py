@@ -35,24 +35,18 @@ class WriteChannelListener:
         writer_fds: List of writer-end file descriptors from the arbiter.
     '''
 
-    def __init__(self, cell, writer_fds):
+    def __init__(self, cell, writer_fds, send_ready=True):
         self._cell = cell
         self._writer_fds = list(writer_fds)
         self._running = False
         self._task = None
-        self._ready = asyncio.Event()
+        self._send_ready = send_ready
 
     async def start(self):
-        '''Start the write channel listener and wait until it is polling.
-
-        Returns only after the epoll loop has entered its first poll(),
-        ensuring that any writes already buffered in the socketpairs will
-        be picked up.
-        '''
+        '''Start the write channel listener as a background task.'''
         self._running = True
         self._task = asyncio.get_running_loop().create_task(self._listen())
-        await self._ready.wait()
-        logger.info('Write channel listener ready with %d worker fds', len(self._writer_fds))
+        logger.info('Write channel listener started with %d worker fds', len(self._writer_fds))
 
     async def stop(self):
         '''Stop the listener and close all writer-end fds.'''
@@ -82,16 +76,14 @@ class WriteChannelListener:
             ep.register(fd, select.EPOLLIN)
             unpackers[fd] = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
 
-        # Signal readiness: send a single byte on each writer-end fd so
-        # workers know the write channel is ready to receive requests.
-        for fd in self._writer_fds:
-            try:
-                os.write(fd, b'\x01')
-            except OSError as e:
-                logger.warning('Failed to send ready byte on fd %d: %s', fd, e)
-
-        # Signal internal ready event
-        self._ready.set()
+        # Signal readiness to workers: send a single byte on each writer-end
+        # fd so the worker's _demux_reader knows the channel is ready.
+        if self._send_ready:
+            for fd in self._writer_fds:
+                try:
+                    os.write(fd, b'\x01')
+                except OSError as e:
+                    logger.warning('Failed to send ready byte on fd %d: %s', fd, e)
 
         try:
             while self._running:
@@ -154,7 +146,7 @@ class WriteChannelListener:
             await self._handle_callStorm(fd, req_id, msg)
         else:
             logger.error('Unknown write request kind %r on fd %d', kind, fd)
-            self._send(fd, ('err', req_id, {'mesg': f'Unknown request kind: {kind}'}))
+            await self._send(fd, ('err', req_id, {'mesg': f'Unknown request kind: {kind}'}))
 
     async def _handle_storm(self, fd, req_id, msg):
         '''Execute cell.storm() and stream results back to the worker.'''
@@ -162,21 +154,19 @@ class WriteChannelListener:
             text = msg[2]
             opts = msg[3] if len(msg) > 3 else None
         except (IndexError, TypeError):
-            self._send(fd, ('err', req_id, {'mesg': 'Malformed storm request'}))
+            await self._send(fd, ('err', req_id, {'mesg': 'Malformed storm request'}))
             return
 
         try:
-            count = 0
             async for mesg in self._cell.storm(text, opts=opts):
-                self._send(fd, ('msg', req_id, mesg))
-                count += 1
-            self._send(fd, ('done', req_id))
+                await self._send(fd, ('msg', req_id, mesg))
+            await self._send(fd, ('done', req_id))
         except Exception as e:
             excinfo = {
                 'mesg': str(e),
                 'err': e.__class__.__name__,
             }
-            self._send(fd, ('err', req_id, excinfo))
+            await self._send(fd, ('err', req_id, excinfo))
 
     async def _handle_callStorm(self, fd, req_id, msg):
         '''Execute cell.callStorm() and return the result to the worker.'''
@@ -184,31 +174,37 @@ class WriteChannelListener:
             text = msg[2]
             opts = msg[3] if len(msg) > 3 else None
         except (IndexError, TypeError):
-            self._send(fd, ('err', req_id, {'mesg': 'Malformed callStorm request'}))
+            await self._send(fd, ('err', req_id, {'mesg': 'Malformed callStorm request'}))
             return
 
         try:
             result = await self._cell.callStorm(text, opts=opts)
-            self._send(fd, ('result', req_id, result))
+            await self._send(fd, ('result', req_id, result))
         except Exception as e:
             excinfo = {
                 'mesg': str(e),
                 'err': e.__class__.__name__,
             }
-            self._send(fd, ('err', req_id, excinfo))
+            await self._send(fd, ('err', req_id, excinfo))
 
-    def _send(self, fd, msg):
+    async def _send(self, fd, msg):
         '''Send a msgpack-encoded message on the given fd.
 
-        Handles partial writes on SOCK_STREAM socketpairs by looping
-        until all bytes are sent.
+        Runs the write in an executor to avoid blocking the event loop
+        when the socket buffer is full. Handles partial writes on
+        SOCK_STREAM socketpairs by looping until all bytes are sent.
         '''
         data = s_msgpack.en(msg)
-        mv = memoryview(data)
-        while mv:
-            try:
-                sent = os.write(fd, mv)
-            except OSError as e:
-                logger.warning('Write channel send failed on fd %d: %s', fd, e)
-                return
-            mv = mv[sent:]
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, _sendall, fd, data)
+        except OSError as e:
+            logger.warning('Write channel send failed on fd %d: %s', fd, e)
+
+
+def _sendall(fd, data):
+    '''Write all bytes to fd, handling partial writes (blocking, thread-safe).'''
+    mv = memoryview(data)
+    while mv:
+        sent = os.write(fd, mv)
+        mv = mv[sent:]

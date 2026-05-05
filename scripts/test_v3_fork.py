@@ -101,8 +101,8 @@ def main():
     stderr_capture.truncate(0)
     stderr_capture.seek(0)
 
-    def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None):
-        s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell, write_fd=write_fd)
+    def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None, dispatch_fd=None):
+        s_worker.worker_main(control_fd, uds_path_arg, datadir, cell=cell, write_fd=write_fd, dispatch_fd=dispatch_fd)
 
     print(f'[phase2] Forking {NUM_WORKERS} workers...')
     arbiter = s_arbiter.Arbiter()

@@ -82,7 +82,7 @@ def classify(text):
 # Worker entry point (called after fork)
 # ---------------------------------------------------------------------------
 
-def worker_main(control_fd, uds_path, datadir, cell=None, write_fd=None):
+def worker_main(control_fd, uds_path, datadir, cell=None, write_fd=None, dispatch_fd=None):
     '''
     Entry point for a forked read worker process.
 
@@ -92,6 +92,7 @@ def worker_main(control_fd, uds_path, datadir, cell=None, write_fd=None):
         datadir: Cortex data directory (for LMDB slab re-open).
         cell: The inherited Cortex cell object (shared via dmon for telepath).
         write_fd: File descriptor of the write channel socketpair to the writer.
+        dispatch_fd: File descriptor of the dispatch channel from the thick router.
     '''
     # Neutralize the inherited forkpool (stale threads/pipes after fork)
     import synapse.lib.processpool as s_processpool
