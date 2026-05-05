@@ -136,6 +136,9 @@ class ThickRouter:
                     break
                 unpacker.feed(data)
                 for msg in unpacker:
+                    # Skip non-tuple messages (e.g. ready byte from PureWorker)
+                    if not isinstance(msg, (list, tuple)) or len(msg) < 2:
+                        continue
                     req_id = msg[1]
                     q = self._pending[fd].get(req_id)
                     if q is not None:
@@ -271,7 +274,7 @@ class ThickRouter:
 
             # Propagate user/view context from session into opts
             if 'user' not in opts:
-                user = sess.get('user')
+                user = getattr(sess, 'user', None)
                 if user is not None:
                     opts = dict(opts)
                     opts['user'] = user

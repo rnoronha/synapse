@@ -51,8 +51,10 @@ def _thick_router_main_with_cell(listen_fd, worker_dispatch_fds, writer_dispatch
     This fixes the cell=None issue in the stock _thick_router_main.
     '''
     from synapse.lib.thickrouter import ThickRouter
+    import synapse.lib.link as s_link
 
     async def _run():
+        print(f'[thick-router pid={os.getpid()}] Starting...', flush=True)
         router = ThickRouter(
             cell=cell,
             worker_fds=worker_dispatch_fds,
@@ -60,10 +62,32 @@ def _thick_router_main_with_cell(listen_fd, worker_dispatch_fds, writer_dispatch
         )
         await router.start()
 
-        # Listen on the inherited socket fd
+        # Share all names from the cell's dmon (not just '*')
+        # Use a minimal proxy that satisfies the telepath handshake
+        # without triggering full CoreApi initialization
+        class _ThickRouterProxy:
+            '''Minimal proxy for telepath handshake in thick router.'''
+            pass
+
+        parent_dmon = getattr(cell, 'dmon', None)
+        if parent_dmon is not None:
+            for name in parent_dmon.shared:
+                router._dmon.share(name, _ThickRouterProxy())
+        else:
+            router._dmon.share('*', _ThickRouterProxy())
+
+        # Listen on the inherited socket fd using asyncio directly
+        # (Daemon.listen() doesn't support pre-created sockets)
         sock = socket.socket(fileno=listen_fd)
         sock.setblocking(False)
-        await router.listen(f'tcp://0.0.0.0', ssl=None, sock=sock)
+
+        async def onconn(reader, writer):
+            link = await s_link.Link.anit(reader, writer, info={'tls': False})
+            link.schedCoro(router._dmon._onLinkInit(link))
+
+        server = await asyncio.start_server(onconn, sock=sock)
+        router._dmon.listenservers.append(server)
+        print(f'[thick-router pid={os.getpid()}] Listening', flush=True)
 
         # Block until shutdown signal
         stop_event = asyncio.Event()
@@ -146,8 +170,15 @@ def main():
 
     # Phase 2: Fork workers and thick router
     def _worker_entry(control_fd, uds_path_arg, worker_id, write_fd=None, dispatch_fd=None):
-        s_worker.worker_main(control_fd, uds_path_arg, info['datadir'], cell=cell,
-                             write_fd=write_fd, dispatch_fd=dispatch_fd)
+        # In thick mode, workers need to handle BOTH:
+        # 1. Thin router connections via control_fd (ReadOnlyWorker)
+        # 2. Thick router dispatch via dispatch_fd (PureWorker)
+        if dispatch_fd is not None:
+            # Run PureWorker for thick router dispatch
+            s_worker.pure_worker_main(dispatch_fd, info['datadir'], cell)
+        else:
+            s_worker.worker_main(control_fd, uds_path_arg, info['datadir'], cell=cell,
+                                 write_fd=write_fd, dispatch_fd=dispatch_fd)
 
     print(f'[phase2] Forking {NUM_WORKERS} workers...')
     arbiter = s_arbiter.Arbiter(router_mode='thick')
@@ -225,6 +256,8 @@ def main():
                                          writer_dispatch_fd, cell)
         except Exception as e:
             import traceback; traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
         finally:
             os._exit(0)
 
@@ -272,6 +305,7 @@ def main():
         nonlocal test_ok
         import synapse.lib.coro as s_coro
         new_loop = asyncio.get_running_loop()
+        evt_count = 0
         for obj in gc.get_objects():
             if isinstance(obj, s_base.Base) and obj.anitted:
                 obj.loop = new_loop
@@ -286,6 +320,7 @@ def main():
                             setattr(obj, attr, s_coro.Event())
                         else:
                             setattr(obj, attr, asyncio.Event())
+                        evt_count += 1
         cell.loop = new_loop
         cell._syn_refs -= 1
         cell.nexsroot._syn_refs -= 3
@@ -337,7 +372,8 @@ def main():
 
         # --- TEST 1: Read queries return results ---
         try:
-            async with await s_telepath.openurl(url) as prox:
+            async with await asyncio.wait_for(
+                    s_telepath.openurl(url), timeout=10.0) as prox:
                 mesgs = []
                 async for mesg in prox.storm('inet:fqdn | limit 5'):
                     mesgs.append(mesg)
@@ -346,6 +382,9 @@ def main():
                 assert not errs, f'Read query errors: {errs}'
                 assert len(nodes) == 5, f'Expected 5 nodes, got {len(nodes)}'
                 print(f'[test1] PASS: Read queries return results ({len(nodes)} nodes)')
+        except asyncio.TimeoutError:
+            print(f'FAIL TEST 1: Timeout connecting to thick router at {url}')
+            return
         except Exception as e:
             print(f'FAIL TEST 1 (read queries): {e}')
             import traceback; traceback.print_exc()

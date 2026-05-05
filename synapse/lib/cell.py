@@ -4761,12 +4761,11 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
                             else:
                                 setattr(obj, attr, asyncio.Event())
                             evt_count += 1
-                            logger.warning('E-6 fix: Recreated %s.%s (%s)', type(obj).__name__, attr, type(val).__name__)
             cell.loop = new_loop
             if fini_count:
                 logger.warning('E-1 fix: Reset isfini on %d Base objects', fini_count)
             if evt_count:
-                logger.warning('E-6 fix: Recreated %d asyncio.Event objects on new loop', evt_count)
+                logger.info('E-6 fix: Recreated %d asyncio.Event objects on new loop', evt_count)
 
             # E-2 fix: Decrement the extra ref we added in _initForFork
             # to prevent fini during asyncio.run() teardown.
