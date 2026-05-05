@@ -4828,6 +4828,16 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
 
             # Re-fire active coros that were cancelled when the init loop closed
             cell._fireActiveCoros()
+
+            # E-5 fix: Restart the Slab sync loop. The class-level synctask
+            # died with the init event loop; without it the writer never
+            # commits dirty transactions and workers cannot see new data.
+            s_lmdbslab.Slab.synctask = None
+            for slab in s_lmdbslab.Slab.allslabs.values():
+                if not slab.readonly:
+                    await s_lmdbslab.Slab.initSyncLoop(slab)
+                    break
+
             await cell.main()
 
         try:
