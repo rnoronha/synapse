@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Deploy and start multi-process Cortex on a remote EC2 instance via SSM.
 # The cortex spawns read-only reader subprocesses internally when
-# multi:process:readers is set in cell.yaml.
+# multi:process:core_pct is set in cell.yaml.
 #
 # Usage: bash scripts/start-mp-cortex.sh <instance-id> [ssm|pem-path] [datadir] [reader-pct]
 
@@ -61,7 +61,7 @@ echo ""
 echo "Step 3: Prepare data directory and config"
 run_and_wait "mkdir -p $DATADIR && python3.11 -c \"
 import json, pathlib
-conf = {'auth:anon': 'root', 'multi:process:readers': $READER_PCT}
+conf = {'auth:anon': 'root', 'multi:process:core_pct': $READER_PCT}
 pathlib.Path('$DATADIR/cell.yaml').write_text(json.dumps(conf))
 print('Config written:', conf)
 \""
@@ -84,4 +84,4 @@ run_and_wait "ss -tlnp | grep -E '2749[0-9]' || echo 'ports not yet listening'"
 echo ""
 echo "=== Deployment complete ==="
 echo "Writer: tcp://$TARGET:27492/cortex"
-echo "Readers are spawned internally by the cortex (multi:process:readers=$READER_PCT%)"
+echo "Readers are spawned internally by the cortex (multi:process:core_pct=$READER_PCT%)"

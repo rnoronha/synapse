@@ -911,8 +911,8 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             'description': 'An optional directory of CAs which are added to the TLS CA chain for Storm HTTP API calls.',
             'type': 'string',
         },
-        'multi:process:readers': {
-            'description': 'Percentage of available CPU cores to use as read-only reader subprocesses. 0=disabled (default), 50=half the cores, 99=all but one core. Rounds down.',
+        'multi:process:core_pct': {
+            'description': 'Percentage of available CPU cores to allocate for the multi-process system (workers + router + writer). 0=disabled (default), 50=half the cores. The arbiter subtracts 2 (router + writer) and allocates the rest as read-only workers.',
             'type': 'integer',
             'default': 0,
             'minimum': 0,
@@ -1772,7 +1772,12 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         await self._initStormSvcs()
 
         self._forkinfo = None
-        pct = self.conf.get('multi:process:readers', 0)
+        pct = self.conf.get('multi:process:core_pct', 0)
+        # Backward compat: accept old key name with deprecation warning
+        if not pct:
+            pct = self.conf.get('multi:process:readers', 0)
+            if pct:
+                logger.warning('Config key "multi:process:readers" is deprecated. Use "multi:process:core_pct" instead.')
         if pct and not self.readonly:
             await self._initForkMode(pct)
         else:
@@ -1858,7 +1863,7 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         if self.readonly:
             return
 
-        pct = self.conf.get('multi:process:readers', 0)
+        pct = self.conf.get('multi:process:core_pct', 0)
         if not pct:
             return
 

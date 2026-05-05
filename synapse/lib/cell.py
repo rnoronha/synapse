@@ -4895,7 +4895,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         try:
             with open(cellpath) as f:
                 conf = yaml.safe_load(f) or {}
-            return conf.get('multi:process:readers', 0) > 0
+            return conf.get('multi:process:core_pct', 0) > 0
         except (OSError, yaml.YAMLError):
             return False
 

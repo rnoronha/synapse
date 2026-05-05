@@ -335,7 +335,7 @@ fi
 
 echo "Writing cell.yaml (readers=$READERS)..."
 if [[ "$READERS" -gt 0 ]]; then
-    run_ssm "printf 'auth:anon: root\nmulti:process:readers: $READERS\n' > $DATADIR/cell.yaml"
+    run_ssm "printf 'auth:anon: root\nmulti:process:core_pct: $READERS\n' > $DATADIR/cell.yaml"
 else
     run_ssm "printf 'auth:anon: root\n' > $DATADIR/cell.yaml"
 fi

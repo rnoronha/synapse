@@ -41,7 +41,7 @@ _core = None
 async def boot_writer(datadir):
     conf = {
         'auth:anon': 'root',
-        'multi:process:readers': 50,
+        'multi:process:core_pct': 50,
     }
     core = await s_cortex.Cortex.anit(datadir, conf=conf)
     await core.addHttpsPort(0)
