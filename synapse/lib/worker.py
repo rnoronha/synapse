@@ -450,3 +450,147 @@ class ReadOnlyWorker:
         '''Signal the worker to stop accepting new connections.'''
         self._stopping = True
         logger.info('Worker %d: shutdown requested', self._pid)
+
+
+# ---------------------------------------------------------------------------
+# Pure Worker — socketpair task receiver for thick router
+# ---------------------------------------------------------------------------
+
+_CANCEL_CHECK_INTERVAL = 64  # Check cancellation every N yielded messages
+
+
+def pure_worker_main(task_fd, datadir, cell):
+    '''
+    Entry point for a pure read worker (thick router mode).
+
+    Receives query tasks via socketpair, executes storm(), streams results
+    back. No Daemon, no connection handling, no write forwarding.
+
+    Args:
+        task_fd: File descriptor of the socketpair to the router.
+        datadir: Cortex data directory (for LMDB slab re-open).
+        cell: The inherited Cortex cell object.
+    '''
+    import synapse.lib.processpool as s_processpool
+    if getattr(s_processpool, 'forkpool', None) is not None:
+        s_processpool.forkpool.shutdown(wait=False)
+        s_processpool.forkpool = None
+
+    _reopen_lmdb_readonly(datadir)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    if cell is not None:
+        import gc
+        import synapse.lib.base as s_base
+        for obj in gc.get_objects():
+            if isinstance(obj, s_base.Base) and obj.anitted:
+                obj.loop = loop
+                obj.finievt = asyncio.Event()
+        cell.loop = loop
+
+    worker = PureWorker(task_fd, cell)
+    try:
+        loop.run_until_complete(worker.serve())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
+class PureWorker:
+    '''
+    Pure read worker for the thick router. Receives query tasks via
+    socketpair, executes cell.storm() directly, streams results back.
+    No Daemon, no connection handling, no write forwarding.
+    '''
+
+    def __init__(self, task_fd, cell):
+        self._task_fd = task_fd
+        self._cell = cell
+        self._pid = os.getpid()
+        self._cancelled = set()  # Set of cancelled req_ids
+
+    async def serve(self):
+        '''Main loop: read tasks from socketpair, execute, stream results.'''
+        loop = asyncio.get_running_loop()
+        unpacker = msgpack.Unpacker(**s_msgpack.unpacker_kwargs)
+
+        # Signal ready to router
+        try:
+            os.write(self._task_fd, b'\x52')
+        except OSError:
+            logger.error('PureWorker %d: failed to send READY', self._pid)
+            return
+
+        logger.info('PureWorker %d: ready', self._pid)
+
+        while True:
+            try:
+                data = await loop.run_in_executor(None, os.read, self._task_fd, _RECV_BUF)
+            except OSError:
+                break
+            if not data:
+                break
+
+            unpacker.feed(data)
+            for msg in unpacker:
+                kind = msg[0]
+                if kind == 'storm':
+                    _, req_id, text, opts = msg
+                    loop.create_task(self._exec_storm(req_id, text, opts))
+                elif kind == 'cancel':
+                    _, req_id = msg
+                    self._cancelled.add(req_id)
+
+        logger.info('PureWorker %d: stopped', self._pid)
+
+    async def _exec_storm(self, req_id, text, opts):
+        '''Execute a storm query and stream results back to the router.'''
+        self._refresh_slabs()
+
+        ropts = dict(opts) if opts else {}
+        ropts['readonly'] = True
+
+        try:
+            count = 0
+            async for mesg in self._cell.storm(text, opts=ropts):
+                if req_id in self._cancelled:
+                    break
+                self._send(('msg', req_id, mesg))
+                count += 1
+                if count % _CANCEL_CHECK_INTERVAL == 0:
+                    await asyncio.sleep(0)  # Yield to process cancellations
+
+            if req_id in self._cancelled:
+                self._cancelled.discard(req_id)
+                self._send(('done', req_id))
+            else:
+                self._send(('done', req_id))
+
+        except s_exc.IsReadOnly:
+            self._send(('err', req_id, {'err': 'IsReadOnly'}))
+        except Exception as e:
+            logger.exception('PureWorker %d: storm error req=%s', self._pid, req_id)
+            self._send(('err', req_id, {'err': type(e).__name__, 'mesg': str(e)}))
+        finally:
+            self._cancelled.discard(req_id)
+
+    def _refresh_slabs(self):
+        '''Refresh all readonly LMDB transactions before each query.'''
+        for slab in s_lmdbslab.Slab.allslabs.values():
+            if slab.readonly:
+                slab._refresh_ro_xact()
+
+    def _send(self, msg):
+        '''Send a msgpack-encoded message to the router via socketpair.'''
+        data = s_msgpack.en(msg)
+        mv = memoryview(data)
+        while mv:
+            try:
+                sent = os.write(self._task_fd, mv)
+                mv = mv[sent:]
+            except OSError:
+                return

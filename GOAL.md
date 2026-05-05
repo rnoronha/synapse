@@ -1,29 +1,32 @@
-# Goal: Thin Router Process — FD Passing to Workers
+# Goal: Thick Router — Per-Query Dispatch to Workers/Writer
 
 ## End State
-A dedicated router process accepts all client TCP connections, then passes the file descriptor to the appropriate target via sendmsg/SCM_RIGHTS over per-worker UDS control channels. Workers receive the fd, complete the telepath handshake, and serve the full session. The writer process receives write-connection fds directly. No stream proxying — zero-copy connection handoff.
+A thick router process owns all client telepath connections, handles handshakes and sessions, demuxes the telepath stream into individual queries, classifies each query, and dispatches reads to workers and writes to the writer via socketpair RPC. Workers are stateless pure readers — they receive query tasks, execute against readonly LMDB, and stream results back. Zero write-handling code in workers.
 
 ## Acceptance Criteria
-1. Router process accepts connections on the public port (27492)
-2. Router passes connection fds to workers via sendmsg/SCM_RIGHTS over UDS
-3. Workers receive fds, complete telepath handshake, serve read queries locally
-4. Write connections are passed to the writer process (not workers)
-5. No throughput regression: >1400 QPS parallel reads on c5.4xlarge
-6. No soak regression: <1% error rate under sustained load
-7. Write throughput improvement: >50 write ops/s (currently ~10 via UDS proxy)
-8. Workers have NO write forwarding code (pure readers)
-9. Local test_v3_fork.py passes with router architecture
+1. Router handles telepath handshake and maintains sessions
+2. All queries dispatched via socketpair RPC (reads to workers, writes to writer)
+3. Workers have zero write-handling code
+4. Streaming results relay correctly (no buffering, backpressure works)
+5. Client cancellation propagates to workers (cooperative, best-effort)
+6. No throughput regression: >1400 QPS parallel reads
+7. Read p50 increase <10% vs thin router baseline (27ms)
+8. Write latency no regression vs current (p50 <200ms)
+9. All existing tests pass (parallel-reads, soak, mixed-load, read-after-write, pathological)
+10. IsReadOnly re-dispatch works: misclassified writes transparently re-routed to writer
+11. Share-returning methods routed to writer with explicit error if attempted on worker
+12. Router respawn completes in <500ms; queued connections served without client error
+13. Router memory stable under 1000 idle connections
 
 ## Constraints
 - Python 3.11
 - Single client-facing URL (port 27492)
-- sendmsg/SCM_RIGHTS requires Unix domain sockets (Linux only — fine for our deployment)
-- Storm Pool remains independent (not merged into router)
+- Reuse Daemon class for telepath protocol handling
+- Socketpair + msgpack RPC for dispatch (proven pattern from write channel)
+- Single router process (multi-router via SO_REUSEPORT only if needed)
 
-## Out of Scope
-- Cross-host routing (Storm Pool handles that)
-- Client-side routing
-- External proxy software
+## Design
+Full design doc: .kiro/analysis/thick-router-design.md
 
 ## Revision History
-- 2026-05-04 — Initial goal after research (thin-router-research.md)
+- 2026-05-05 — Initial goal from design doc (reviewed by gpu-devils-advocate)
