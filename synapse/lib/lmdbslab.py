@@ -887,12 +887,18 @@ class Slab(s_base.Base):
         self.recovering = False
 
         opts.setdefault('max_dbs', 128)
+        opts.setdefault('max_readers', 256)
         opts.setdefault('writemap', True)
 
         self.maxsize = opts.pop('maxsize', None)
         self.growsize = opts.pop('growsize', self.DEFAULT_GROWSIZE)
 
         self.readonly = opts.get('readonly', False)
+
+        import synapse.lib.forkmode as s_forkmode
+        if s_forkmode.is_readonly_worker:
+            self.readonly = True
+            opts['readonly'] = True
         self.readahead = opts.get('readahead', True)
         self.lockmemory = opts.pop('lockmemory', False)
 
@@ -1026,6 +1032,27 @@ class Slab(s_base.Base):
         self.txnrefcount -= 1
         if not self.txnrefcount:
             self._finiCoXact()
+
+    def _refresh_ro_xact(self):
+        '''Cycle the read-only transaction to release the MVCC snapshot.
+
+        Called per-query (not on a timer) to ensure readers see the latest
+        committed data from the writer process.
+        '''
+        if self.xact is None:
+            return
+
+        [scan.bump() for scan in self.scans]
+
+        self.xact.abort()
+        del self.xact
+        self.xact = None
+
+        try:
+            self._initCoXact()
+        except Exception:
+            logger.exception("Failed to refresh readonly transaction, shutting down slab")
+            self.schedCallSafe(self.fini)
 
     def _saveOptsFile(self):
         if self.readonly:
@@ -1265,6 +1292,10 @@ class Slab(s_base.Base):
                 # This can only happen if readonly and another process added data (e.g. cortex spawn)
                 # _initCoXact knows the magic to resolve this
                 self._initCoXact()
+            except lmdb.NotFoundError:
+                if self.readonly:
+                    return None
+                raise
 
     def dropdb(self, name):
         '''
@@ -1679,7 +1710,7 @@ class Slab(s_base.Base):
 
     def _xact_action(self, calling_func, xact_func, lkey, *args, db=None, **kwargs):
         if self.readonly:
-            raise s_exc.IsReadOnly()
+            return None
 
         realdb, dupsort = self.dbnames[db]
 

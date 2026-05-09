@@ -81,3 +81,4 @@ venv
 # Linter files
 .mypy_cache/
 
+.beads/

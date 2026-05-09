@@ -1665,6 +1665,9 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         self._cellguidfd.close()
 
     def _getCellLock(self):
+        import synapse.lib.forkmode as s_forkmode
+        if s_forkmode.is_readonly_worker:
+            return
         cmd = fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
             fcntl.lockf(self._cellguidfd, cmd)
@@ -1845,6 +1848,15 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
 
     async def _bumpCellVers(self, name, updates, nexs=True):
 
+        import synapse.lib.forkmode as s_forkmode
+        if s_forkmode.is_readonly_worker:
+            curv = self.cellvers.get(name, 0)
+            reqv = updates[-1][0]
+            if curv < reqv:
+                mesg = f'Storage requires migration ({name} v{curv} -> v{reqv}). Boot in write mode first.'
+                raise s_exc.NeedConfValu(mesg=mesg)
+            return
+
         if self.inaugural:
             await self.setCellVers(name, updates[-1][0], nexs=nexs)
             return
@@ -1996,7 +2008,15 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         path = s_common.gendir(self.dirn, 'slabs', 'drive.lmdb')
         sockpath = s_common.genpath(self.sockdirn, 'drive')
 
-        if s_common.envbool('SYNDEV_CELL_DRIVE_NOSPAWN'):
+        # Readonly workers open the drive slab directly (no spawned subprocess)
+        # since they cannot write and don't need the FileDrive IPC layer.
+        import synapse.lib.forkmode as s_forkmode
+        if s_forkmode.is_readonly_worker:
+            self.drive_slab = await self._initSlabFile(path)
+            self.drive = await s_drive.Drive.anit(self.drive_slab, s_drive.CELLDRIVE)
+        elif s_common.envbool('SYNDEV_CELL_DRIVE_NOSPAWN'):
+            # Dev/test mode: open drive slab in-process without spawning a
+            # FileDrive subprocess.  Avoids IPC overhead in unit tests.
             self.drive_slab = await self._initSlabFile(path)
             self.drive = await s_drive.Drive.anit(self.drive_slab, s_drive.CELLDRIVE)
         else:
@@ -3319,48 +3339,16 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         if user is not None:
             return user.pack(packroles=True)
 
-    async def getUserIdenByName(self, name):
-        user = await self.auth.getUserByName(name)
-        if user is not None:
-            return user.iden
-
-    async def getUserRoles(self, iden):
-        user = self.auth.user(iden)
-        if user is None:
-            return
-
-        for role in user.getRoles():
-            yield role
-
     async def getRoleDefByName(self, name):
         role = await self.auth.getRoleByName(name)
         if role is not None:
             return role.pack()
 
-    async def getRoleIdenByName(self, name):
-        role = await self.auth.getRoleByName(name)
-        if role is not None:
-            return role.iden
-
     async def getUserDefs(self):
         return [u.pack(packroles=True) for u in self.auth.users()]
 
-    def hasUserIden(self, iden):
-        return self.auth.user(iden) is not None
-
-    async def getUserIdens(self):
-        for useriden in self.auth.useridens():
-            yield useriden
-
     async def getRoleDefs(self):
         return [r.pack() for r in self.auth.roles()]
-
-    def hasRoleIden(self, iden):
-        return self.auth.role(iden) is not None
-
-    async def getRoleIdens(self):
-        for roleiden in self.auth.roleidens():
-            yield roleiden
 
     async def getAuthUsers(self, archived=False):
         return [u.pack() for u in self.auth.users() if archived or not u.info.get('archived')]
@@ -3752,6 +3740,7 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         s_common.gendir(self.dirn, 'slabs')
 
         path = os.path.join(self.dirn, 'slabs', 'cell.lmdb')
+
         if not os.path.exists(path) and readonly:
             logger.warning('Creating a slab for a readonly cell.')
             _slab = await s_lmdbslab.Slab.anit(path, map_size=SLAB_MAP_SIZE)
@@ -4152,6 +4141,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
                           help=f'The (optional) additional name to share the {name} as. This defaults to '
                                f'{telendef}, and may be also be overridden by the {telenvar} environment'
                                f' variable.')
+        pars.add_argument('--readonly', default=False, action='store_true',
+                          help='Start the cell in read-only mode.')
 
         if conf is not None:
             args = conf.getArgParseArgs()
@@ -4596,6 +4587,9 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
         s_processpool._setPoolLogging(logconf)
 
         try:
+            if opts.readonly:
+                import synapse.lib.forkmode as s_forkmode
+                s_forkmode.is_readonly_worker = True
             cell = await cls.anit(opts.dirn, conf=conf)
         except:
             logger.exception(f'Error starting cell at {opts.dirn}')
@@ -4607,6 +4601,8 @@ class Cell(s_nexus.Pusher, s_telepath.Aware):
             if turl is None:
                 turl = opts.telepath
                 await cell.dmon.listen(turl)
+
+            cell._listen_url = turl
 
             logger.info(f'...{cell.getCellType()} API (telepath): {turl}')
 

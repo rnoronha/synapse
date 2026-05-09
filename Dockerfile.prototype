@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends tini && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY synapse /build/synapse/synapse
+COPY README.rst /build/synapse/README.rst
+COPY pyproject.toml /build/synapse/pyproject.toml
+
+RUN pip install --no-cache-dir /build/synapse && rm -rf /build
+
+ENV SYN_LOG_LEVEL="INFO"
+ENV PYTHONFAULTHANDLER=1
+EXPOSE 4443 27492
+VOLUME /vertex/storage
+
+ENTRYPOINT ["tini", "--", "python", "-O", "-m", "synapse.servers.cortex", "/vertex/storage"]
+HEALTHCHECK --start-period=10s --retries=1 --timeout=10s --interval=30s \
+  CMD python -m synapse.tools.service.healthcheck -c cell:///vertex/storage/
