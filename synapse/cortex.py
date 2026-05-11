@@ -47,6 +47,9 @@ import synapse.lib.jsonstor as s_jsonstor
 import synapse.lib.modelrev as s_modelrev
 import synapse.lib.stormsvc as s_stormsvc
 import synapse.lib.lmdbslab as s_lmdbslab
+import synapse.lib.arbiter as s_arbiter
+import synapse.lib.worker as s_worker
+import synapse.lib.forkmode as s_forkmode
 
 import synapse.lib.crypto.rsa as s_rsa
 
@@ -906,6 +909,13 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             'description': 'An optional directory of CAs which are added to the TLS CA chain for Storm HTTP API calls.',
             'type': 'string',
         },
+        'multi:process:core_pct': {
+            'description': 'Percentage of available CPU cores to use as read-only reader subprocesses. 0=disabled (default), 50=half the cores, 99=all but one core. Rounds down.',
+            'type': 'integer',
+            'default': 0,
+            'minimum': 0,
+            'maximum': 100,
+        },
     }
 
     cellapi = CoreApi
@@ -926,8 +936,9 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             self.cellinfo.set('cortex:version', s_version.version)
 
         corevers = self.cellinfo.get('cortex:version')
-        s_version.reqVersion(corevers, reqver, exc=s_exc.BadStorageVersion,
-                             mesg='cortex version in storage is incompatible with running software')
+        if corevers is not None:
+            s_version.reqVersion(corevers, reqver, exc=s_exc.BadStorageVersion,
+                                 mesg='cortex version in storage is incompatible with running software')
 
         self.viewmeta = self.slab.initdb('view:meta')
 
@@ -944,8 +955,7 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
 
         self.migration = False
         self._migration_lock = asyncio.Lock()
-        if __debug__:
-            self._migration_evnt = asyncio.Event()
+        self._migration_evnt = asyncio.Event()
 
         self.stormmods = {}     # name: mdef
         self.stormpkgs = {}     # name: pkgdef
@@ -1716,6 +1726,13 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         role = await self.auth.getRoleByName('all')
         await role.addRule((True, ('layer', 'read')), gateiden=layriden)
 
+    def _lmdbReaderCheck(self):
+        '''Clear stale LMDB reader slots from crashed reader processes.'''
+        return s_forkmode.lmdb_reader_check(self)
+
+    async def _lmdbReaderCheckLoop(self):
+        await s_forkmode.lmdb_reader_check_loop(self)
+
     async def initServiceRuntime(self):
 
         # do any post-nexus initialization here...
@@ -1727,7 +1744,14 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
         if not self.safemode:
             self.addActiveCoro(self.agenda.runloop)
 
+        self.addActiveCoro(self._lmdbReaderCheckLoop)
+
         await self._initStormSvcs()
+
+        self._forkinfo = None
+        pct = self.conf.get('multi:process:core_pct', 0)
+        if pct and not s_forkmode.is_readonly_worker:
+            await self._initForkMode(pct)
 
         # share ourself via the cell dmon as "cortex"
         # for potential default remote use
@@ -1736,7 +1760,6 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
     async def initServiceActive(self):
 
         await self.stormdmons.start()
-        await self.initStormPool()
 
         async def _runMigrations():
             await self.boss.promote('cortex:migration:layers', self.auth.rootuser, background=True, protected=True)
@@ -1744,33 +1767,28 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
             # Run migrations when this cortex becomes active. This is to prevent
             # migrations getting skipped in a zero-downtime upgrade path
             # (upgrade mirror, promote mirror).
-            try:
-                await self._checkLayerModels()
-            finally:
-                if __debug__:
-                    self._migration_evnt.set()
+            await self._checkLayerModels()
 
-        if self.safemode:
-            if __debug__:
-                self._migration_evnt.set()
-            return
+            # Once migrations are complete, start the view and layer tasks.
+            for view in self.views.values():
+                await view.initTrigTask()
+                await view.initMergeTask()
 
-        for view in self.views.values():
-            await view.initTrigTask()
-            await view.initMergeTask()
+            for layer in self.layers.values():
+                await layer.initLayerActive()
 
-        for layer in self.layers.values():
-            await layer.initLayerActive()
+            for pkgdef in list(self.stormpkgs.values()):
+                self._runStormPkgOnload(pkgdef)
 
-        for pkgdef in list(self.stormpkgs.values()):
-            self._runStormPkgOnload(pkgdef)
+            self._migration_evnt.set()
+
+        await self.initStormPool()
 
         self.runActiveTask(_runMigrations())
 
     async def initServicePassive(self):
 
-        if __debug__:
-            self._migration_evnt.clear()
+        self._migration_evnt.clear()
 
         await self.stormdmons.stop()
 
@@ -1810,6 +1828,14 @@ class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
 
         except Exception as e:  # pragma: no cover
             logger.exception(f'Error starting stormpool, it will not be available: {e}')
+
+    async def _initForkMode(self, pct):
+        '''Set up fork-mode config.'''
+        await s_forkmode.init_cortex_fork_mode(self, pct)
+
+    async def prepareFork(self):
+        '''Finalize fork setup after all init phases complete.'''
+        return await s_forkmode.prepare_cortex_fork(self)
 
     async def finiStormPool(self):
 
